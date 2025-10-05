@@ -263,11 +263,12 @@ def main(cfg):
             log_dir = get_log_dir(cfg.train_folder)
             os.makedirs(log_dir / "wandb", exist_ok=False)
             run = wandb.init(
-                project='calvin_eval',
-                entity=cfg.wandb.entity,
-                group=cfg.model_name + cfg.sampler_type + '_' + str(cfg.num_sampling_steps) + '_steps_' + str(cfg.cond_lambda) + '_c_' + str(cfg.num_sequences) + '_rollouts_',
-                config=dict(cfg),
-                dir=log_dir / "wandb",
+                name="calvin_eval"
+                # project='calvin_eval',
+                # entity=cfg.wandb.entity,
+                # group=cfg.model_name + cfg.sampler_type + '_' + str(cfg.num_sampling_steps) + '_steps_' + str(cfg.cond_lambda) + '_c_' + str(cfg.num_sequences) + '_rollouts_',
+                # config=dict(cfg),
+                # dir=log_dir / "wandb",
             )
 
             results[checkpoint], plans[checkpoint] = evaluate_policy(model, env, lang_embeddings, cfg, num_videos=cfg.num_videos, save_dir=Path(log_dir))

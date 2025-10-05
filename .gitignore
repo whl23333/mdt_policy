@@ -1,3 +1,96 @@
+# .gitignore for mdt_policy (Python / ML project)
+# Keep common editor, OS, virtualenv, build and ML artifacts out of git
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Byte-compiled / caches
+.pytest_cache/
+.mypy_cache/
+.cache/
+.coverage
+
+# Virtual environments / Conda
+venv/
+env/
+.venv/
+miniconda3/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data, results, models, checkpoints
+data/
+datasets/
+results/
+logs/
+ckpts/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.npz
+*.pkl
+
+# Large archives and binaries
+*.tar
+*.tar.gz
+*.zip
+*.gz
+*.tgz
+mujoco210-linux-x86_64.tar.gz
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+
+# Environment / secrets
+.env
+*.env
+secrets/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Packaging
+*.egg
+*.egg-info
+dist/
+build/
+
+# Local python dependencies cache
+.pip-wheel-metadata/
+
+# Coverage / test reports
+htmlcov/
+coverage.xml
+
+# Other
+.ropeproject/
+
+# If you want to keep some files in a directory that is ignored, add a
+# negation rule, for example to keep a README in results/:
+# !results/README.md
 pretrained_models
 vcache
 
@@ -167,4 +260,5 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
-
+calvin_debug_dataset/
+voltron_cache/

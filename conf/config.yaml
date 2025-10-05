@@ -8,20 +8,20 @@ defaults:
 # /home/hk-project-robolear/ft4740/code/calvin_d_old/dataset/task_D_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABC_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABCD_D
-root_data_dir: /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABCD_D
-lang_folder: lang_clip_resnet50 
+root_data_dir: /home/hlwang/mdt_policy/calvin_debug_dataset
+lang_folder: lang_annotations
 vis_clip_model_name: ViT-B/16 
 clip_lang_model_name: ViT-B/32
 
-log_dir: /home/hk-project-sustainebot/ft4740/code/mdt_policy/logs
+log_dir: /home/hlwang/mdt_policy/logs
 slurm: false
 min_window_size: 21 # 21
 max_window_size: 50
 future_range: 29
 seed: 242
 device: 'cuda'
-batch_size: 128 # 38 # 128
-devices: 4
+batch_size: 16 # 38 # 128
+devices: 1
 goal_window_size: 1
 act_dim: 7
 obs_dim: 384
@@ -54,11 +54,9 @@ logger:
   _target_: pytorch_lightning.loggers.WandbLogger
   save_dir: .
   name: logger
-  group: mdt
   log_model: false
-  project: ${benchmark_name} # calvin_vision
-  entity: bennoq
-  id: ???
+  entity: whl23333-tsinghua-university
+  project: mdt_policy
 
 
 hydra:

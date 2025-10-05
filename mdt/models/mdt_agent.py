@@ -463,6 +463,45 @@ class MDTAgent(pl.LightningModule):
             return cont_loss_part 
         else:
             return torch.tensor(0.0).to(self.device)  # Return a zero tensor if "lang" is not in the modality scope
+        
+    def compute_latent_goal_embeddings(self, dataset_batch):
+        """
+        Compute the latent goal embeddings for the language and mae modalities.
+        """
+        t5_lang_emb = None
+        mae_emb = None
+        lang_attention_mask = None
+        if "lang" in self.modality_scope:
+            lang_text = dataset_batch["lang_text"]
+            tokenized = self.t5_tokenizer(
+                lang_text,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+            lang_input_ids = tokenized.input_ids
+            lang_attention_mask = tokenized.attention_mask
+
+            # freeze t5 encoder
+            for _, param in self.t5_encoder.named_parameters():
+                param.requires_grad = False
+            self.t5_encoder.eval()
+            with torch.no_grad():
+                t5_outputs = self.t5_encoder(
+                    input_ids=lang_input_ids,
+                    attention_mask=lang_attention_mask
+                )
+                t5_lang_emb = t5_outputs.last_hidden_state
+            t5_lang_emb = self.embed_lang(t5_lang_emb.float()) # (b, lang_tokens, hidden_dim)
+        
+        # mae embeddings
+
+        
+
+        if "mae" in self.modality_scope:
+            rgb_static_goal = dataset_batch["rgb_obs"]['rgb_static'][:, -1]
+            mae_emb = self.visual_goal(rgb_static_goal).to(rgb_static_goal.dtype)
+        
+        return t5_lang_emb, mae_emb
 
     
     def _log_training_metrics(self, action_loss, total_loss, cont_loss, img_gen_loss, total_bs):
