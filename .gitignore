@@ -46,7 +46,7 @@ trainer_test_results/
 **/events.out.tfevents*
 **/*.log
 **/tb_logs/
-latent_motion_tokenizer/
+**/saved_epoch*/
 ckpts/
 checkpoints/
 *.ckpt
