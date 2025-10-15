@@ -151,8 +151,13 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         m_former_ckpt_path: Optional[str] = None,
         m_former3d_ckpt_path: Optional[str] = None,
         vq_down_resampler_ckpt_path: Optional[str] = None,
+        tokenizer_ckpt_path: Optional[str] = None,
         lang_feat_dim: int = 768,
         img_feat_dim: int = 1024,
+        # Soft codebook expectation for training
+        use_soft_codebook_training: bool = True,
+        soft_code_temp: float = 1.0,
+        soft_code_detach: bool = True,
     ):
         super(MDT3dLatentActionAgent, self).__init__()
         self.latent_dim = latent_dim
@@ -163,6 +168,9 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         self.gen_img = hydra.utils.instantiate(img_gen)
         self.seed = seed
         self.use_lr_scheduler = use_lr_scheduler
+        
+        # Goal processing attributes
+        self.use_delta_goal = False  # Add missing attribute
         
         # Latent motion parameters
         self.latent_motion_codebook_size = latent_motion_codebook_size
@@ -183,6 +191,7 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                 n_heads=transformer_n_heads,
                 use_pos_embedding=True,
                 mask_probability=0.0,
+                parallel_prediction=True,
             )
             
             # Pretrained models for 3D motion tokenization pipeline
@@ -193,6 +202,11 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                 self.pretrained_m_former3d = self._load_pretrained_m_former3d(m_former3d_ckpt_path)
                 self.pretrained_vq_down_resampler = self._load_pretrained_vq_down_resampler(vq_down_resampler_ckpt_path)
                 self.pretrained_vq = self._load_pretrained_vq(vq_ckpt_path)
+
+                # Load all components from unified LatentMotionTokenizer3D checkpoint if provided
+
+                if tokenizer_ckpt_path is not None:
+                    self.load_from_latent_motion_tokenizer3d(tokenizer_ckpt_path)
                 
                 # Freeze all pretrained components
                 for param in self.pretrained_image_encoder.parameters():
@@ -265,6 +279,10 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         # embedding latent motion input to diffusion policy
         if self.latent_motion_pred:
             self.embed_latent_motion_input = nn.Linear(self.latent_motion_dim, self.latent_dim)
+            # soft codebook config
+            self.use_soft_codebook_training = use_soft_codebook_training
+            self.soft_code_temp = soft_code_temp
+            self.soft_code_detach = soft_code_detach
 
     def _load_pretrained_image_encoder(self, image_encoder_ckpt_path):
         """Load pretrained image encoder (ViT-MAE)."""
@@ -413,6 +431,76 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             param.requires_grad = False
             
         return model
+
+    def load_from_latent_motion_tokenizer3d(self, tokenizer_ckpt_path):
+        """
+        Load pretrained components from a unified LatentMotionTokenizer3D checkpoint.
+        
+        Args:
+            tokenizer_ckpt_path: Path to pytorch_model.bin from LatentMotionTokenizer3D
+        """
+        print(f"Loading components from LatentMotionTokenizer3D checkpoint: {tokenizer_ckpt_path}")
+        
+        # Load the unified checkpoint
+        checkpoint = torch.load(tokenizer_ckpt_path, map_location='cpu')
+        
+        # Extract component states from unified checkpoint
+        component_states = {
+            # 'image_encoder': {},
+            'm_former': {},
+            'm_former3d': {},
+            'vq_down_resampler': {},
+            'vector_quantizer': {}
+        }
+        
+        # Parse checkpoint keys and distribute to components
+        for key, value in checkpoint.items():
+            # if key.startswith('image_encoder.'):
+            #     component_key = key.replace('image_encoder.', '')
+            #     component_states['image_encoder'][component_key] = value
+            if key.startswith('m_former.'):
+                component_key = key.replace('m_former.', '')
+                component_states['m_former'][component_key] = value
+            elif key.startswith('m_former3d.'):
+                component_key = key.replace('m_former3d.', '')
+                component_states['m_former3d'][component_key] = value
+            elif key.startswith('vq_down_resampler.'):
+                component_key = key.replace('vq_down_resampler.', '')
+                component_states['vq_down_resampler'][component_key] = value
+            elif key.startswith('vector_quantizer.'):
+                component_key = key.replace('vector_quantizer.', '')
+                component_states['vector_quantizer'][component_key] = value
+        
+        # Load each component with extracted state dict
+        # if component_states['image_encoder']:
+        #     print("Loading image_encoder from unified checkpoint...")
+        #     self.pretrained_image_encoder.load_state_dict(component_states['image_encoder'], strict=False)
+            
+        if component_states['m_former']:
+            print("Loading m_former from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_m_former.load_state_dict(component_states['m_former'], strict=False)
+            print(f"m_former missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+            
+        if component_states['m_former3d']:
+            print("Loading m_former3d from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_m_former3d.load_state_dict(component_states['m_former3d'], strict=False)
+            print(f"m_former3d missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+
+        if component_states['vq_down_resampler']:
+            print("Loading vq_down_resampler from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_vq_down_resampler.load_state_dict(component_states['vq_down_resampler'], strict=False)
+            print(f"vq_down_resampler missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+
+        if component_states['vector_quantizer']:
+            print("Loading vector_quantizer from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_vq.load_state_dict(component_states['vector_quantizer'], strict=False)
+            print(f"vector_quantizer missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+
+        # print("Successfully loaded all components from LatentMotionTokenizer3D checkpoint!")
+        
+        # Report loaded components
+        loaded_components = [name for name, state in component_states.items() if state]
+        print(f"Loaded components: {loaded_components}")
 
     def validate_model_setup(self) -> Dict[str, Any]:
         """
@@ -764,28 +852,33 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     perceptual_features=combined_features,
                     latent_motion_ids=gt_latent_motion_indices,
                     attention_mask=combined_mask,
-                    train=True
+                    train=True,
+                    seq_len=T
                 )
                 
                 latent_motion_loss += motion_results['loss']
                 
                 # Get latent motion embeddings for diffusion conditioning
-                predicted_motion_ids = motion_results.get('latent_motion_preds')
-                if predicted_motion_ids is not None:
-                    # predicted_motion_ids shape: (B, seq_len, per_latent_motion_len, vocab_size)
-                    # Contains raw logits (unnormalized), both positive and negative values
-                    
-                    # Use same sampling strategy as inference for train-test consistency
-                    B, seq_len, per_len, vocab_size = predicted_motion_ids.shape
-                    predicted_motion_ids_flat = predicted_motion_ids.view(-1, vocab_size)  # (B*seq_len*per_len, vocab_size)
-                    
-                    # Apply softmax and multinomial sampling (same as inference)
-                    probs = F.softmax(predicted_motion_ids_flat, dim=-1)
-                    predicted_indices_flat = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B*seq_len*per_len,)
-                    predicted_indices = predicted_indices_flat.view(B, seq_len, per_len)  # (B, seq_len, per_latent_motion_len)
-                    
-                    # use pretrained vq codebook and predicted indices to get embeddings
-                    latent_motion_emb = self.pretrained_vq.get_codebook_entry(predicted_indices)
+                predicted_motion_logits = motion_results.get('latent_motion_preds')
+                if predicted_motion_logits is not None:
+                    # Option A: hard sampling (default)
+                    if not self.use_soft_codebook_training:
+                        B, seq_len, per_len, vocab_size = predicted_motion_logits.shape
+                        logits_flat = predicted_motion_logits.view(-1, vocab_size)
+                        probs = F.softmax(logits_flat, dim=-1)
+                        sampled_idx_flat = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                        sampled_idx = sampled_idx_flat.view(B, seq_len, per_len)
+                        latent_motion_emb = self.pretrained_vq.get_codebook_entry(sampled_idx)
+                    else:
+                        # Option B: soft expectation over codebook for stability
+                        B, seq_len, per_len, vocab_size = predicted_motion_logits.shape
+                        temp = max(self.soft_code_temp, 1e-6)
+                        logits_flat = predicted_motion_logits.view(-1, vocab_size) / temp
+                        probs = F.softmax(logits_flat, dim=-1)  # (B*seq_len*per_len, vocab)
+                        codebook = self.pretrained_vq.embedding.weight  # (vocab, e_dim)
+                        soft_emb_flat = probs @ codebook  # (B*seq_len*per_len, e_dim)
+                        soft_emb = soft_emb_flat.view(B, seq_len, per_len, -1)
+                        latent_motion_emb = soft_emb.detach() if self.soft_code_detach else soft_emb
                 else:
                     latent_motion_emb = None
 
@@ -871,6 +964,83 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             latent_motion_emb = None
             
             if self.latent_motion_pred:
+                with torch.no_grad():
+                    rgb_static = dataset_batch["rgb_obs"]['rgb_static'][:, :-1]    # (B, T, C, H, W) - condition images for view1
+                    rgb_gripper = dataset_batch["rgb_obs"]['rgb_gripper'][:, :-1]  # (B, T, C, H, W) - condition images for view2
+                    # reshape: 84*84-> 224*224
+                    rgb_gripper = self.interpolate_img(rgb_gripper, size=(224, 224))
+                    
+                    if 'gen_static' in dataset_batch["rgb_obs"] and 'gen_gripper' in dataset_batch["rgb_obs"]:
+                        gen_static = dataset_batch["rgb_obs"]['gen_static']        # (B, T, C, H, W) - target images for view1
+                        gen_gripper = dataset_batch["rgb_obs"]['gen_gripper']      # (B, T, C, H, W) - target images for view2
+                        # reshape: 112*112-> 224*224
+                        gen_static = self.interpolate_img(gen_static, size=(224, 224))
+                        gen_gripper = self.interpolate_img(gen_gripper, size=(224, 224))
+                    else:
+                        # Fallback: use current frame as target (no motion)
+                        gen_static = rgb_static
+                        gen_gripper = rgb_gripper
+                    
+                    B, T = rgb_static.shape[:2]
+                    
+                    gt_latent_motion_indices = []
+                    for t in range(T):
+                        # Step 1: Encode images using pretrained image encoder
+                        cond_static_encoded = self.pretrained_image_encoder(rgb_static[:, t])      # Output with last_hidden_state: (B, num_patches, hidden_dim)
+                        target_static_encoded = self.pretrained_image_encoder(gen_static[:, t])    # Output with last_hidden_state: (B, num_patches, hidden_dim)
+                        cond_gripper_encoded = self.pretrained_image_encoder(rgb_gripper[:, t])    # Output with last_hidden_state: (B, num_patches, hidden_dim)
+                        target_gripper_encoded = self.pretrained_image_encoder(gen_gripper[:, t])  # Output with last_hidden_state: (B, num_patches, hidden_dim)
+                        
+                        # Step 2: Extract motion tokens for each viewpoint using m_former
+                        # View 1 (static camera): condition=rgb_static, target=gen_static
+                        motion_tokens_view1 = self.pretrained_m_former(
+                            cond_hidden_states=cond_static_encoded.last_hidden_state,
+                            target_hidden_states=target_static_encoded.last_hidden_state
+                        ).last_hidden_state[:, :self.pretrained_m_former.query_num]  # (B, query_num, hidden_dim)
+                        
+                        # View 2 (gripper camera): condition=rgb_gripper, target=gen_gripper  
+                        motion_tokens_view2 = self.pretrained_m_former(
+                            cond_hidden_states=cond_gripper_encoded.last_hidden_state,
+                            target_hidden_states=target_gripper_encoded.last_hidden_state
+                        ).last_hidden_state[:, :self.pretrained_m_former.query_num]  # (B, query_num, hidden_dim)
+                        
+                        # Step 3: Fuse two viewpoints using m_former3d
+                        combined_tokens = torch.cat([motion_tokens_view1, motion_tokens_view2], dim=1)  # (B, query_num*2, hidden_dim)
+                        fused_3d_motion_tokens = self.pretrained_m_former3d(combined_tokens).last_hidden_state[:, :self.pretrained_m_former3d.query_num]  # (B, query_3d, hidden_dim)
+                        
+                        # Step 4: Down-sample and quantize using VQ
+                        motion_tokens_down = self.pretrained_vq_down_resampler(fused_3d_motion_tokens)  # (B, query_3d, codebook_dim)
+                        
+                        # # Quantize each query token separately and collect indices
+                        # query_3d = motion_tokens_down.shape[1]
+                        # indices_list = []
+                        # for q in range(query_3d):
+                        #     _, indices_q, _ = self.pretrained_vq(motion_tokens_down[:, q])  # indices_q: (B,)
+                        #     indices_list.append(indices_q)
+                        # indices_t = torch.stack(indices_list, dim=1)  # (B, query_3d)
+                        
+                        # gt_latent_motion_indices.append(indices_t)
+                        _, indices, _ = self.pretrained_vq(motion_tokens_down) # quant: (B, query_3d, codebook_dim), indices: (B, query_3d)
+                        gt_latent_motion_indices.append(indices)
+                    
+                    # Stack all timesteps: (B, T, query_3d)  
+                    gt_latent_motion_indices = torch.stack(gt_latent_motion_indices, dim=1)
+                    
+                    # Expand or truncate to match per_latent_motion_len
+                    if self.per_latent_motion_len != gt_latent_motion_indices.shape[-1]:
+                        if self.per_latent_motion_len > gt_latent_motion_indices.shape[-1]:
+                            # Repeat the last dimension to match per_latent_motion_len
+                            repeat_factor = self.per_latent_motion_len // gt_latent_motion_indices.shape[-1]
+                            remainder = self.per_latent_motion_len % gt_latent_motion_indices.shape[-1]
+                            
+                            repeated_indices = gt_latent_motion_indices.repeat(1, 1, repeat_factor)
+                            if remainder > 0:
+                                repeated_indices = torch.cat([repeated_indices, gt_latent_motion_indices[:, :, :remainder]], dim=-1)
+                            gt_latent_motion_indices = repeated_indices
+                        else:
+                            # Truncate if per_latent_motion_len is smaller
+                            gt_latent_motion_indices = gt_latent_motion_indices[:, :, :self.per_latent_motion_len]
+
                 # Prepare perceptual features for motion transformer (same as training)
                 combined_features, combined_mask = self.compute_latent_goal_embeddings_and_mask(dataset_batch)
 
@@ -887,12 +1057,13 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     perceptual_features=combined_features,
                     latent_motion_ids=dummy_latent_motion_indices,
                     attention_mask=combined_mask,
-                    train=False  # Set to False for validation
+                    train=False,  # Set to False for validation
+                    seq_len=T
                 )
                 
                 # Get latent motion embeddings for diffusion conditioning
-                predicted_motion_ids = motion_results.get('latent_motion_id_preds')
-                if predicted_motion_ids is not None:
+                predicted_motion_indices = motion_results.get('latent_motion_id_preds')
+                if predicted_motion_indices is not None:
                     # predicted_motion_ids shape: (B, seq_len, per_latent_motion_len, vocab_size)
                     # Contains raw logits (unnormalized), both positive and negative values
                     
@@ -906,9 +1077,15 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     # predicted_indices = predicted_indices_flat.view(B, seq_len, per_len)  # (B, seq_len, per_latent_motion_len)
                     
                     # use pretrained vq codebook and predicted indices to get embeddings
-                    latent_motion_emb = self.pretrained_vq.get_codebook_entry(predicted_motion_ids)
+                    latent_motion_emb = self.pretrained_vq.get_codebook_entry(predicted_motion_indices)
                 else:
                     latent_motion_emb = None
+            
+            # latent action generation loss
+            gt_latent_motion_embeddings = self.pretrained_vq.get_codebook_entry(gt_latent_motion_indices)
+            cosine_sim = torch.nn.CosineSimilarity(dim=-1)
+            motion_sim = cosine_sim(latent_motion_emb, gt_latent_motion_embeddings).mean()
+            self.log(f"val/{self.modality_scope}_latent_motion_cosine_sim", motion_sim, on_step=False, on_epoch=True, sync_dist=True)
 
             # predict the next action sequence with latent motion conditioning
             action_pred = self.denoise_actions(
@@ -1180,8 +1357,9 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         noise = torch.randn_like(actions).to(self.device)
         
         # If latent motion embeddings are provided, concatenate them with latent_goal
-        latent_motion_emb = self.embed_latent_motion_input(latent_motion_emb)
-        latent_motion_emb = latent_motion_emb.view(latent_motion_emb.shape[0], -1, latent_motion_emb.shape[-1]) # (B, seq_len*per_latent_motion_len, hidden_dim)
+        if self.latent_motion_pred and latent_motion_emb is not None:
+            latent_motion_emb = self.embed_latent_motion_input(latent_motion_emb)
+            latent_motion_emb = latent_motion_emb.view(latent_motion_emb.shape[0], -1, latent_motion_emb.shape[-1]) # (B, seq_len*per_latent_motion_len, hidden_dim)
         if latent_motion_emb is not None:
             if latent_goal is not None:
                 if len(latent_goal.shape) == 2:
@@ -1431,7 +1609,8 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     perceptual_features=combined_features,
                     latent_motion_ids=dummy_latent_motion_indices,
                     attention_mask=combined_mask,
-                    train=False
+                    train=False,
+                    seq_len=T
                 )
                 
                 # Get latent motion embeddings for diffusion conditioning

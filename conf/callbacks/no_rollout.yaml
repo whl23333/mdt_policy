@@ -1,0 +1,19 @@
+# Callbacks configuration without any evaluation/rollout callbacks
+# Use this to save checkpoints periodically from the start without running eval
+
+# Keep the same checkpointing behavior (overridden in checkpoint/lh_sr.yaml)
+defaults:
+  - checkpoint: lh_sr_no_rollout
+
+# Optionally keep EMA if it's desired during training; comment out to disable
+ema:
+  _target_: mdt.callbacks.ema.EMA
+  decay: 0.999
+  start_step: 0
+  save_ema_weights_in_callback_state: True
+  evaluate_ema_weights_instead: True
+
+  power: 0.6666666666666666
+  inv_gamma: 1.0
+  min_value: 0.0
+  max_value: 0.9999

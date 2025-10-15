@@ -1,5 +1,6 @@
 defaults:
   - callbacks: calvin
+  # - callbacks: no_rollout
   - datamodule: calvin
   - model: mdt_3d_latent_agent # mdt_agent
   - override hydra/job_logging: colorlog
@@ -8,8 +9,8 @@ defaults:
 # /home/hk-project-robolear/ft4740/code/calvin_d_old/dataset/task_D_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABC_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABCD_D
-root_data_dir: /home/hlwang/mdt_policy/calvin_debug_dataset
-lang_folder: lang_annotations
+root_data_dir: /media/disk3/WHL/task_D_D
+lang_folder: lang_clip_resnet50
 vis_clip_model_name: ViT-B/16 
 clip_lang_model_name: ViT-B/32
 
@@ -21,7 +22,7 @@ future_range: 29
 seed: 242
 device: 'cuda'
 batch_size: 16 # 38 # 128
-devices: 1
+devices: 8
 goal_window_size: 1
 act_dim: 7
 obs_dim: 384
@@ -36,9 +37,9 @@ rollout_lh_skip_epochs: 29
 window_sampling_strategy: 'geometric' 
 num_tokens_voltron: 3
 num_workers: 12
-img_gen_frame_diff: 3 
+img_gen_frame_diff: 5 
 use_extracted_rel_actions: true
-benchmark_name: calvin_abcd # calvin_abcd  
+benchmark_name: calvin_d # calvin_abcd  
 
 
 trainer:

@@ -24,6 +24,7 @@ use_distributed_clip: True
 use_text_not_embedding: True
 ckpt_path: null
 seed: ${seed}
+tokenizer_ckpt_path: '/home/hlwang/mdt_policy/mdt/latent_motion_tokenizer/saved_epoch_8_step_51208/pytorch_model.bin'
 
 optimizer:
   _target_: torch.optim.AdamW

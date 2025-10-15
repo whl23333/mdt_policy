@@ -26,6 +26,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         dropout: float = 0.1,
         use_pos_embedding: bool = True,
         mask_probability: float = 0.0,
+        parallel_prediction: bool = False,
     ):
         super().__init__()
         
@@ -36,6 +37,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         self.latent_motion_codebook_size = latent_motion_codebook_size
         self.mask_probability = mask_probability
         self.use_pos_embedding = use_pos_embedding
+        self.parallel_prediction = parallel_prediction
         
         # Input projection
         self.input_projection = nn.Linear(input_dim, hidden_size)
@@ -64,6 +66,12 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         
         # Prediction head for latent motion
         self.pred_latent_motion_head = nn.Linear(hidden_size, latent_motion_codebook_size, bias=False)
+        # Parallel per-step head: predicts per_latent_motion_len tokens at once per timestep
+        self.pred_latent_motion_parallel_head = nn.Linear(
+            hidden_size,
+            per_latent_motion_len * latent_motion_codebook_size,
+            bias=False,
+        )
         
     def forward(
         self,
@@ -102,9 +110,12 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         latent_motion_ids: torch.Tensor,  # (batch, seq_len, per_latent_motion_len)
         attention_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
-        """Training forward pass with teacher forcing on flattened sequence."""
+        """Training forward pass with teacher forcing.
+        If parallel_prediction is True, predict K=per_len tokens per timestep in parallel (factorized).
+        Else, predict all tokens autoregressively on the flattened sequence.
+        """
         batch_size, cond_tokens, _ = cond_embeddings.shape
-        seq_len, per_len = latent_motion_ids.shape[1], latent_motion_ids.shape[2]
+        seq_len, per_len = latent_motion_ids.shape[1], latent_motion_ids.shape[2]  
         total_latent_tokens = seq_len * per_len
         
         # Flatten latent motion IDs to a single sequence
@@ -147,31 +158,49 @@ class SimplifiedLatentMotionPredictor(nn.Module):
             inputs_embeds=stacked_inputs,
             attention_mask=full_attention_mask,
         )
-        
         hidden_states = outputs.last_hidden_state
-        
-        # For teacher forcing: use positions [cond_tokens : cond_tokens + 1 + total_latent_tokens - 1] 
-        # to predict latent motion tokens [0, 1, ..., total_latent_tokens-1]
-        # Position cond_tokens is start_token -> predicts latent_token_0
-        # Position cond_tokens+1 is latent_token_0 -> predicts latent_token_1
-        # ...
-        # Position cond_tokens+total_latent_tokens-1 is latent_token_{N-2} -> predicts latent_token_{N-1}
-        prediction_hidden = hidden_states[:, cond_tokens:-1]  # (batch, 1+total_latent_tokens-1, hidden_size)
-        latent_motion_preds_flat = self.pred_latent_motion_head(prediction_hidden)  # (batch, total_latent_tokens, codebook_size)
-        
-        # Targets are the flattened latent motion IDs
-        targets_flat = latent_motion_ids_flat  # (batch, total_latent_tokens)
-        
-        # Compute loss on flattened predictions
-        loss = self._compute_loss_flat_with_start(latent_motion_preds_flat, targets_flat, None, seq_len, per_len)
-        
-        # Reshape predictions for output compatibility
-        latent_motion_preds = latent_motion_preds_flat.view(batch_size, seq_len, per_len, -1)  # (batch, seq_len, per_len, codebook_size)
-        
-        return {
-            'latent_motion_preds': latent_motion_preds,
-            'loss': loss,
-        }
+
+        if self.parallel_prediction:
+            # Use context positions at the start of each timestep to predict all K tokens in parallel
+            # Context position for step t is cond_tokens + t*per_len (hidden at last seen token before step t)
+            device = hidden_states.device
+            ctx_positions = cond_tokens + torch.arange(seq_len, device=device) * per_len  # (seq_len,)
+            # Gather hidden states at these positions for all batches
+            batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, seq_len)
+            ctx_positions_exp = ctx_positions.unsqueeze(0).expand(batch_size, seq_len)
+            ctx_hidden = hidden_states[batch_idx, ctx_positions_exp, :]  # (B, seq_len, hidden)
+
+            logits_parallel = self.pred_latent_motion_parallel_head(ctx_hidden)  # (B, seq_len, K*V)
+            logits_parallel = logits_parallel.view(batch_size, seq_len, per_len, self.latent_motion_codebook_size)
+
+            # Compute CE over (B, T, K)
+            loss = self._compute_loss(
+                logits_parallel,
+                latent_motion_ids,
+                attention_mask=None,
+            )
+
+            return {
+                'latent_motion_preds': logits_parallel,  # (B, T, K, V)
+                'loss': loss,
+            }
+        else:
+            # Autoregressive flattened token prediction
+            # For teacher forcing: positions [cond_tokens : cond_tokens + total_latent_tokens] predict tokens [0..N-1]
+            prediction_hidden = hidden_states[:, cond_tokens:-1]  # (batch, 1+total_latent_tokens-1, hidden_size)
+            latent_motion_preds_flat = self.pred_latent_motion_head(prediction_hidden)  # (batch, total_latent_tokens, codebook_size)
+            targets_flat = latent_motion_ids_flat  # (batch, total_latent_tokens)
+
+            # Compute loss on flattened predictions
+            loss = self._compute_loss_flat_with_start(latent_motion_preds_flat, targets_flat, None, seq_len, per_len)
+
+            # Reshape predictions for output compatibility
+            latent_motion_preds = latent_motion_preds_flat.view(batch_size, seq_len, per_len, -1)
+
+            return {
+                'latent_motion_preds': latent_motion_preds,
+                'loss': loss,
+            }
     
     def _forward_inference(
         self, 
@@ -184,18 +213,25 @@ class SimplifiedLatentMotionPredictor(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Inference forward pass with autoregressive generation."""
         
-        # Generate latent motion IDs autoregressively
-        latent_motion_ids = self._generate_latent_motion(
-            cond_embeddings, 
-            attention_mask,
-            seq_len=seq_len,
-            temperature=temperature,
-            top_k=top_k
-        )
-        
-        return {
-            'latent_motion_id_preds': latent_motion_ids,
-        }
+        if self.parallel_prediction:
+            ids = self._generate_latent_motion_parallel(
+                cond_embeddings,
+                attention_mask,
+                seq_len=seq_len,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            return {'latent_motion_id_preds': ids}
+        else:
+            # Generate latent motion IDs autoregressively across all flattened tokens
+            latent_motion_ids = self._generate_latent_motion(
+                cond_embeddings, 
+                attention_mask,
+                seq_len=seq_len,
+                temperature=temperature,
+                top_k=top_k
+            )
+            return {'latent_motion_id_preds': latent_motion_ids}
     
     def _generate_latent_motion(
         self,
@@ -276,6 +312,75 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         latent_motion_ids = generated_tensor.view(batch_size, seq_len, self.per_latent_motion_len)  # (batch, seq_len, per_latent_motion_len)
         
         return latent_motion_ids
+
+    def _generate_latent_motion_parallel(
+        self,
+        cond_embeddings: torch.Tensor,  # (batch, cond_tokens, hidden_size)
+        attention_mask: Optional[torch.Tensor] = None,
+        seq_len: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 0,
+    ) -> torch.Tensor:
+        """Generate K tokens per timestep in parallel (factorized), autoregressive across timesteps only."""
+        batch_size, cond_tokens, _ = cond_embeddings.shape
+        device = cond_embeddings.device
+        per_len = self.per_latent_motion_len
+
+        # Normalize condition once
+        cond_embeddings_normed = self.embed_ln(cond_embeddings)
+        start_token_emb = self.start_token.weight.view(1, 1, -1).repeat(batch_size, 1, 1)
+        start_token_emb_normed = self.embed_ln(start_token_emb)
+
+        # Sequence begins with cond + start
+        current_sequence = torch.cat([cond_embeddings_normed, start_token_emb_normed], dim=1)  # (B, cond_tokens+1, H)
+
+        all_ids = []
+        for t in range(seq_len):
+            # Build attention mask for current sequence
+            if attention_mask is not None:
+                cond_mask = attention_mask
+            else:
+                cond_mask = torch.ones(batch_size, cond_tokens, device=device)
+
+            start_mask = torch.ones(batch_size, 1, device=device)
+            latent_mask = torch.ones(batch_size, current_sequence.shape[1] - cond_tokens - 1, device=device)
+            current_mask = torch.cat([cond_mask, start_mask, latent_mask], dim=1)
+
+            # Forward
+            outputs = self.transformer(inputs_embeds=current_sequence, attention_mask=current_mask)
+            ctx_hidden = outputs.last_hidden_state[:, -1]  # (B, H) context for this timestep
+
+            # Parallel head -> (B, K*V) -> (B, K, V)
+            logits = self.pred_latent_motion_parallel_head(ctx_hidden)
+            logits = logits.view(batch_size, per_len, self.latent_motion_codebook_size)
+
+            # Apply temperature and top-k per K
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            logits_flat = logits.view(batch_size * per_len, self.latent_motion_codebook_size)
+            if top_k > 0:
+                values, _ = torch.topk(logits_flat, top_k, dim=-1)
+                min_values = values[:, -1:].expand_as(logits_flat)
+                logits_flat = torch.where(
+                    logits_flat < min_values,
+                    torch.full_like(logits_flat, float('-inf')),
+                    logits_flat,
+                )
+
+            probs = F.softmax(logits_flat, dim=-1)
+            next_ids_flat = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B*K,)
+            next_ids = next_ids_flat.view(batch_size, per_len)  # (B, K)
+            all_ids.append(next_ids)
+
+            # Append new embeddings (normalized) for next timestep context
+            next_token_emb = self.embed_latent_motion(next_ids)  # (B, K, H)
+            next_token_emb = self.embed_ln(next_token_emb)
+            current_sequence = torch.cat([current_sequence, next_token_emb], dim=1)
+
+        # Stack steps -> (B, T, K)
+        ids = torch.stack(all_ids, dim=1)
+        return ids
     
     def _compute_loss_flat_with_start(
         self, 
@@ -318,47 +423,47 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         
         return loss
     
-    def _compute_loss_flat(
-        self, 
-        predictions: torch.Tensor,  # (batch, total_tokens-1, codebook_size)
-        targets: torch.Tensor,      # (batch, total_tokens-1)
-        attention_mask: Optional[torch.Tensor],  # (batch, seq_len) 
-        seq_len: int,
-        per_len: int
-    ) -> torch.Tensor:
-        """Compute cross-entropy loss for flattened sequence prediction."""
-        batch_size = predictions.shape[0]
-        total_tokens_minus_1 = predictions.shape[1]
-        vocab_size = predictions.shape[2]
+    # def _compute_loss_flat(
+    #     self, 
+    #     predictions: torch.Tensor,  # (batch, total_tokens-1, codebook_size)
+    #     targets: torch.Tensor,      # (batch, total_tokens-1)
+    #     attention_mask: Optional[torch.Tensor],  # (batch, seq_len) 
+    #     seq_len: int,
+    #     per_len: int
+    # ) -> torch.Tensor:
+    #     """Compute cross-entropy loss for flattened sequence prediction."""
+    #     batch_size = predictions.shape[0]
+    #     total_tokens_minus_1 = predictions.shape[1]
+    #     vocab_size = predictions.shape[2]
         
-        # Flatten for loss computation
-        predictions_flat = predictions.view(-1, vocab_size)  # (batch*(total_tokens-1), vocab_size)
-        targets_flat = targets.view(-1)  # (batch*(total_tokens-1))
+    #     # Flatten for loss computation
+    #     predictions_flat = predictions.view(-1, vocab_size)  # (batch*(total_tokens-1), vocab_size)
+    #     targets_flat = targets.view(-1)  # (batch*(total_tokens-1))
         
-        # Create loss mask from attention_mask if provided
-        if attention_mask is not None:
-            # Expand attention mask: each timestep contributes per_len tokens
-            loss_mask = attention_mask.unsqueeze(-1).repeat(1, 1, per_len)  # (batch, seq_len, per_len)
-            loss_mask = loss_mask.view(batch_size, seq_len * per_len)  # (batch, total_tokens)
-            loss_mask = loss_mask[:, 1:]  # Remove first token (we predict tokens 1 to total_tokens)
-            loss_mask = loss_mask.view(-1)  # (batch*(total_tokens-1))
-        else:
-            loss_mask = torch.ones_like(targets_flat, dtype=torch.bool)
+    #     # Create loss mask from attention_mask if provided
+    #     if attention_mask is not None:
+    #         # Expand attention mask: each timestep contributes per_len tokens
+    #         loss_mask = attention_mask.unsqueeze(-1).repeat(1, 1, per_len)  # (batch, seq_len, per_len)
+    #         loss_mask = loss_mask.view(batch_size, seq_len * per_len)  # (batch, total_tokens)
+    #         loss_mask = loss_mask[:, 1:]  # Remove first token (we predict tokens 1 to total_tokens)
+    #         loss_mask = loss_mask.view(-1)  # (batch*(total_tokens-1))
+    #     else:
+    #         loss_mask = torch.ones_like(targets_flat, dtype=torch.bool)
         
-        # Compute cross-entropy loss
-        loss = F.cross_entropy(
-            predictions_flat, 
-            targets_flat, 
-            reduction='none'
-        )
+    #     # Compute cross-entropy loss
+    #     loss = F.cross_entropy(
+    #         predictions_flat, 
+    #         targets_flat, 
+    #         reduction='none'
+    #     )
         
-        # Apply mask and compute mean
-        if loss_mask.sum() > 0:
-            loss = (loss * loss_mask.float()).sum() / loss_mask.float().sum()
-        else:
-            loss = loss.mean()
+    #     # Apply mask and compute mean
+    #     if loss_mask.sum() > 0:
+    #         loss = (loss * loss_mask.float()).sum() / loss_mask.float().sum()
+    #     else:
+    #         loss = loss.mean()
         
-        return loss
+    #     return loss
     
     def _compute_loss(
         self, 

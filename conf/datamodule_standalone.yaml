@@ -1,0 +1,245 @@
+# 独立的DataModule配置文件，包含所有必要参数，避免递归插值问题
+# 基于config_latent.yaml和datamodule/calvin.yaml合并而成
+
+_target_: mdt.datasets.hulc_data_module.HulcDataModule
+_recursive_: false
+
+# 数据路径配置
+root_data_dir: /home/hlwang/mdt_policy/calvin_debug_dataset
+num_workers: 12
+shuffle_val: false
+
+# 动作空间配置
+action_space: 7
+action_max: [1., 1., 1., 1., 1., 1., 1.]
+action_min: [-1., -1., -1., -1., -1., -1., -1]
+
+# 观察空间配置
+observation_space:
+  rgb_obs: ['rgb_static', 'rgb_gripper', 'gen_static', 'gen_gripper']
+  depth_obs: []
+  state_obs: ['robot_obs']
+  actions: ['rel_actions']
+  language: ['language']
+
+# 本体感觉维度配置
+proprioception_dims:
+  n_state_obs: 8
+  keep_indices: [[0, 7], [14, 15]]
+  robot_orientation_idx: [3, 6]
+  normalize: true
+  normalize_robot_orientation: true
+
+# 数据集配置
+datasets:
+  lang_dataset: 
+    _target_: mdt.datasets.disk_dataset.ExtendedDiskDataset
+    key: "lang"
+    save_format: "npz"
+    batch_size: 16
+    min_window_size: 21
+    max_window_size: 50
+    proprio_state:
+      n_state_obs: 8
+      keep_indices: [[0, 7], [14, 15]]
+      robot_orientation_idx: [3, 6]
+      normalize: true
+      normalize_robot_orientation: true
+    obs_space:
+      rgb_obs: ['rgb_static', 'rgb_gripper', 'gen_static', 'gen_gripper']
+      depth_obs: []
+      state_obs: ['robot_obs']
+      actions: ['rel_actions']
+      language: ['language']
+    skip_frames: 1
+    pad: false
+    lang_folder: "lang_annotations"
+    aux_lang_loss_window: 8
+    num_workers: 12
+    geometric_p_value: 0.1
+    window_sampling_strategy: 'geometric'
+    action_seq_len: 10
+    obs_seq_len: 1
+    future_range: 29
+    img_gen_frame_diff: 5
+    use_extracted_rel_actions: true
+
+  vision_dataset:
+    _target_: mdt.datasets.disk_dataset.ExtendedDiskDataset
+    key: "vis"
+    save_format: "npz"
+    batch_size: 16
+    min_window_size: 21
+    max_window_size: 50
+    proprio_state:
+      n_state_obs: 8
+      keep_indices: [[0, 7], [14, 15]]
+      robot_orientation_idx: [3, 6]
+      normalize: true
+      normalize_robot_orientation: true
+    obs_space:
+      rgb_obs: ['rgb_static', 'rgb_gripper', 'gen_static', 'gen_gripper']
+      depth_obs: []
+      state_obs: ['robot_obs']
+      actions: ['rel_actions']
+      language: ['language']
+    pad: false
+    lang_folder: "lang_annotations"
+    num_workers: 12
+    window_sampling_strategy: 'geometric'
+    geometric_p_value: 0.1
+    action_seq_len: 10
+    obs_seq_len: 1
+    future_range: 29
+    img_gen_frame_diff: 5
+    use_extracted_rel_actions: true
+
+# 数据变换配置
+transforms:
+  train:
+    rgb_static:
+      - _target_: torchvision.transforms.Resize
+        size: 224
+        antialias: true
+      - _target_: mdt.utils.transforms.RandomShiftsAug
+        pad: 10
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    gen_static:
+      - _target_: torchvision.transforms.Resize
+        size: 112
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    rgb_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 84
+        antialias: true
+      - _target_: mdt.utils.transforms.RandomShiftsAug
+        pad: 4
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    gen_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 112
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    depth_static:
+      - _target_: torchvision.transforms.Resize
+        size: 200
+      - _target_: mdt.utils.transforms.AddDepthNoise
+        shape: [1000.0]
+        rate: [1000.0]
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    depth_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 84
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    rgb_tactile:
+      - _target_: torchvision.transforms.Resize
+        size: 70
+      - _target_: torchvision.transforms.RandomCrop
+        size: 64
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.5]
+        std: [0.5]
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    depth_tactile:
+      - _target_: torchvision.transforms.Resize
+        size: 64
+        antialias: true
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.1]
+        std: [0.2]
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    robot_obs:
+      - _target_: mdt.utils.transforms.NormalizeVector
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    scene_obs:
+      - _target_: mdt.utils.transforms.NormalizeVector
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+    language:
+      - _target_: mdt.utils.transforms.AddGaussianNoise
+        mean: [0.0]
+        std: [0.01]
+
+  val:
+    rgb_static:
+      - _target_: torchvision.transforms.Resize
+        size: 224
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    rgb_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 84
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    gen_static:
+      - _target_: torchvision.transforms.Resize
+        size: 112
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    gen_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 112
+        antialias: true
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.48145466, 0.4578275, 0.40821073]
+        std: [0.26862954, 0.26130258, 0.27577711]
+    depth_static:
+      - _target_: torchvision.transforms.Resize
+        size: 200
+    depth_gripper:
+      - _target_: torchvision.transforms.Resize
+        size: 84
+    rgb_tactile:
+      - _target_: torchvision.transforms.Resize
+        size: 70
+      - _target_: torchvision.transforms.RandomCrop
+        size: 64
+      - _target_: mdt.utils.transforms.ScaleImageTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.5]
+        std: [0.5]
+    depth_tactile:
+      - _target_: torchvision.transforms.Resize
+        size: 64
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.1]
+        std: [0.2]
+    robot_obs:
+      - _target_: mdt.utils.transforms.NormalizeVector
+    scene_obs:
+      - _target_: mdt.utils.transforms.NormalizeVector
