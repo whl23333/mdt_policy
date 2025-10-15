@@ -38,6 +38,15 @@ data/
 datasets/
 results/
 logs/
+lightning_logs/
+wandb/
+trainer_test_results/
+**/metrics.csv
+**/hparams.yaml
+**/events.out.tfevents*
+**/*.log
+**/tb_logs/
+latent_motion_tokenizer/
 ckpts/
 checkpoints/
 *.ckpt
