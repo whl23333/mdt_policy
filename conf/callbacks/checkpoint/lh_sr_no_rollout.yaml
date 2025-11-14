@@ -1,10 +1,11 @@
-_target_: pytorch_lightning.callbacks.ModelCheckpoint
-# Save from the start of training, every 2 epochs, on train epoch end
-save_top_k: -1               # save all checkpoints at the given frequency
+_target_: mdt.callbacks.skip_then_every_n.SkipThenEveryNEpochsCheckpoint
+# Skip the first N epochs entirely, then save every 5 epochs on train epoch end
+save_top_k: -1               # save all checkpoints at the given cadence
 verbose: True
 dirpath: saved_models
 filename: '{epoch:02d}'
-every_n_epochs: 1
+skip_first_n_epochs: 28      # change this to your warm-up length
+every_n_epochs: 5            # save cadence after skipping
 save_on_train_epoch_end: true
-# No validation metric needed; we disable monitor so saving is not tied to evaluation
+# No validation metric needed; saving is not tied to evaluation
 # monitor: null

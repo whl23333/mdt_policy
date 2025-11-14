@@ -36,6 +36,24 @@ def load_evaluation_checkpoint(cfg):
     return pl_module
 
 
+# def get_checkpoint_i_from_dir(dir, i: int = -1):
+#     ckpt_paths = list(dir.rglob("*.ckpt"))
+#     if i == -1:
+#         for ckpt_path in ckpt_paths:
+#             if ckpt_path.stem == "last":
+#                 return ckpt_path
+
+#     # Search for ckpt of epoch i
+#     for ckpt_path in ckpt_paths:
+#         split_path = str(ckpt_path).split("_")
+#         for k, word in enumerate(split_path):
+#             if word == "epoch":
+#                 if int(split_path[k + 1]) == i:
+#                     return ckpt_path
+
+#     sorted(ckpt_paths, key=lambda f: f.stat().st_mtime)
+#     return ckpt_paths[i]
+
 def get_checkpoint_i_from_dir(dir, i: int = -1):
     ckpt_paths = list(dir.rglob("*.ckpt"))
     if i == -1:
@@ -45,13 +63,13 @@ def get_checkpoint_i_from_dir(dir, i: int = -1):
 
     # Search for ckpt of epoch i
     for ckpt_path in ckpt_paths:
-        split_path = str(ckpt_path).split("_")
+        split_path = str(ckpt_path).split("=")  # 修改为支持 "epoch=40" 格式
         for k, word in enumerate(split_path):
-            if word == "epoch":
-                if int(split_path[k + 1]) == i:
+            if word.endswith("epoch"):
+                if int(split_path[k + 1].split(".")[0]) == i:  # 提取数字部分
                     return ckpt_path
 
-    sorted(ckpt_paths, key=lambda f: f.stat().st_mtime)
+    ckpt_paths = sorted(ckpt_paths, key=lambda f: f.stat().st_mtime)
     return ckpt_paths[i]
 
 
@@ -73,6 +91,7 @@ def load_pl_module_from_checkpoint(
     if filepath.is_dir():
         filedir = filepath
         ckpt_path = get_checkpoint_i_from_dir(dir=filedir, i=epoch)
+        print("Resolved checkpoint path:", ckpt_path)
     elif filepath.is_file():
         assert filepath.suffix == ".ckpt", "File must have .ckpt extension"
         ckpt_path = filepath
@@ -87,23 +106,297 @@ def load_pl_module_from_checkpoint(
     module_class = load_class(class_name)
     print(f"Loading model from {ckpt_path}")
     load_cfg = {**config.model, **overwrite_cfg}
-    model = module_class.load_from_checkpoint(ckpt_path, **load_cfg)
-     # Load EMA weights if they exist and the flag is set
+    # Use strict=False to tolerate non-critical key mismatches from external/frozen modules
+    model = module_class.load_from_checkpoint(ckpt_path, strict=False, **load_cfg)
+    k_list = []
+    for k, v in model.named_parameters():
+        k_list.append(k)
+    root_k = set([kk.split(".")[0] for kk in k_list])
+    print(f"model.latent_motion_pred: {model.latent_motion_pred}")
+    print("Root keys in model:", root_k)
+
+    # Summarize state_dict mismatches (strict=False): missing/unexpected/shape mismatches
+    try:
+        ckpt_blob = torch.load(ckpt_path, map_open_rl=None) if False else torch.load(ckpt_path, map_location="cpu")
+        ckpt_state = ckpt_blob.get("state_dict", ckpt_blob) if isinstance(ckpt_blob, dict) else {}
+        if isinstance(ckpt_state, dict):
+            model_state = model.state_dict()
+            model_keys = set(model_state.keys())
+            ckpt_keys = set(ckpt_state.keys())
+
+            unexpected_keys = sorted(list(ckpt_keys - model_keys))
+            missing_keys = sorted(list(model_keys - ckpt_keys))
+            missing_root_keys = set([k.split(".")[0] for k in missing_keys])
+
+            shape_mismatch = []
+            matched = 0
+            for k in ckpt_keys & model_keys:
+                v_ckpt = ckpt_state[k]
+                v_model = model_state[k]
+                ckpt_shape = getattr(v_ckpt, "shape", None)
+                model_shape = getattr(v_model, "shape", None)
+                if ckpt_shape == model_shape:
+                    matched += 1
+                else:
+                    shape_mismatch.append((k, ckpt_shape, model_shape))
+
+            total_model = len(model_state)
+            coverage = matched / total_model if total_model else 1.0
+
+            def _preview(seq, n=20):
+                return list(seq)[:n]
+
+            print("=== Checkpoint load summary (strict=False) ===")
+            print(f"Model keys: {total_model} | Ckpt keys: {len(ckpt_state)} | Matched (name+shape): {matched} ({coverage:.1%})")
+            print(f"Missing root keys in ckpt: {len(missing_root_keys)} | showing all:")
+            print(missing_root_keys)
+            print(f"Unexpected keys in ckpt: {len(unexpected_keys)} | showing up to 20:")
+            for k in _preview(unexpected_keys):
+                print(f"  + {k}")
+            print(f"Shape mismatches: {len(shape_mismatch)} | showing up to 20:")
+            for k, cs, ms in _preview(shape_mismatch):
+                print(f"  * {k}: ckpt{tuple(cs) if cs is not None else cs} vs model{tuple(ms) if ms is not None else ms}")
+            print("============================================")
+    except Exception as e:
+        print(f"Warning: failed to summarize state_dict mismatches: {e}")
+    # Load EMA weights if they exist and the flag is set (safely)
     if use_ema_weights:
-        checkpoint_data = torch.load(ckpt_path)
-        if "ema_weights" in checkpoint_data['callbacks']['EMA']:
-            ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
+        try:
+            checkpoint_data = torch.load(ckpt_path, map_location="cpu")
+            ema_loaded = False
             
-            # Convert list of tensors to a state_dict format
-            ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model.named_parameters())}
-            
-            model.load_state_dict(ema_weights_dict)
-            print("Successfully loaded EMA weights from checkpoint!")
-        else:
-            print("Warning: No EMA weights found in checkpoint!")
+            # Helper to compute similarity between base and candidate EMA by L2 diff ratio
+            def _diff_metrics(base_sd: dict, cand_sd: dict):
+                ratios = []
+                try:
+                    from statistics import median
+                except Exception:
+                    median = lambda x: sorted(x)[len(x)//2] if x else None
+                for k, b in base_sd.items():
+                    c = cand_sd.get(k)
+                    if not isinstance(b, torch.Tensor) or not isinstance(c, torch.Tensor):
+                        continue
+                    if b.shape != getattr(c, 'shape', None):
+                        continue
+                    if b.numel() == 0:
+                        continue
+                    bn = torch.linalg.norm(b.float()).item()
+                    dn = torch.linalg.norm((c.float() - b.float())).item()
+                    ratios.append(dn / (bn + 1e-12))
+                if not ratios:
+                    return {"count": 0, "mean": None, "median": None, "p95": None}
+                ratios_sorted = sorted(ratios)
+                p95 = ratios_sorted[int(0.95 * (len(ratios_sorted) - 1))]
+                return {
+                    "count": len(ratios),
+                    "mean": sum(ratios) / len(ratios),
+                    "median": median(ratios),
+                    "p95": p95,
+                }
+            # Try common locations for EMA state dicts
+            ema_candidates = []
+            if isinstance(checkpoint_data, dict):
+                # 1) Top-level common keys
+                for k in [
+                    "ema_state_dict",
+                    "state_dict_ema",
+                    "model_ema_state_dict",
+                ]:
+                    if k in checkpoint_data and isinstance(checkpoint_data[k], dict):
+                        ema_candidates.append(checkpoint_data[k])
+                # 2) Under callbacks (e.g., pl EMA callback)
+                cb = checkpoint_data.get("callbacks") if isinstance(checkpoint_data.get("callbacks"), dict) else None
+                if cb:
+                    # Base state_dict for order-based fallback
+                    base_sd = checkpoint_data.get("state_dict", {}) if isinstance(checkpoint_data, dict) else {}
+                    base_names = tuple(base_sd.keys()) if isinstance(base_sd, dict) else None
+                    # Explicit EMA callback handling with base-order detection
+                    if "EMA" in cb and isinstance(cb["EMA"], dict):
+                        ema_cb = cb["EMA"]
+                        # If only ema_weights list exists without names, align using base state_dict key order
+                        only_list = isinstance(ema_cb.get("ema_weights"), (list, tuple)) and not any(
+                            isinstance(ema_cb.get(nk), (list, tuple)) for nk in ["param_names", "names", "parameter_names", "keys"]
+                        )
+                        if isinstance(ema_cb.get("ema_weights"), dict):
+                            only_list = False
+                            ema_weights = ema_cb["ema_weights"]
+                            missing_keys, unexpected_keys = model.load_state_dict(ema_weights, strict=False)
+                            missing_root_keys = set([k.split(".")[0] for k in missing_keys])
+                            print(f"Loaded EMA weights from checkpoint EMA callback dict | missing root keys: {missing_root_keys} | unexpected keys: {len(unexpected_keys)}")
+                            ema_loaded = True
+                            
+                        if only_list and base_names and len(ema_cb["ema_weights"]) == len(base_names):
+                            ema_sd = dict(zip(base_names, ema_cb["ema_weights"]))
+                            # Print detection and similarity
+                            print("Detected EMA weights without names; using base state_dict key order mapping.")
+                            metrics = _diff_metrics(base_sd, ema_sd) if isinstance(base_sd, dict) else {"count": 0}
+                            if metrics.get("count", 0) > 0:
+                                print(
+                                    f"EMA mapping: base-order | L2 ratio mean={metrics['mean']:.4e}, median={metrics['median']:.4e}, p95={metrics['p95']:.4e} over {metrics['count']} params"
+                                )
+                            # Load filtered subset matching model
+                            model_state = model.state_dict()
+                            filtered = {k: v for k, v in ema_sd.items() if k in model_state and getattr(v, "shape", None) == model_state[k].shape}
+                            print(f"Attempting EMA load (base-order): {len(filtered)} params")
+                            load_res = model.load_state_dict(filtered, strict=False)
+                            print(f"EMA load result -> missing: {len(load_res.missing_keys)}, unexpected: {len(load_res.unexpected_keys)}")
+                            ema_loaded = True
+                        # Also handle nested 'ema' dict with list-only weights
+                        if not ema_loaded and isinstance(ema_cb.get("ema"), dict):
+                            nested = ema_cb["ema"]
+                            nested_weights = None
+                            if isinstance(nested.get("ema_weights"), (list, tuple)):
+                                nested_weights = nested["ema_weights"]
+                            elif isinstance(nested.get("weights"), (list, tuple)):
+                                nested_weights = nested["weights"]
+                            only_list_nested = nested_weights is not None and not any(
+                                isinstance(nested.get(nk), (list, tuple)) for nk in ["param_names", "names", "parameter_names", "keys"]
+                            )
+                            if only_list_nested and base_names and len(nested_weights) == len(base_names):
+                                ema_sd = dict(zip(base_names, nested_weights))
+                                print("Detected nested EMA weights without names; using base state_dict key order mapping.")
+                                metrics = _diff_metrics(base_sd, ema_sd) if isinstance(base_sd, dict) else {"count": 0}
+                                if metrics.get("count", 0) > 0:
+                                    print(
+                                        f"EMA mapping: base-order (nested) | L2 ratio mean={metrics['mean']:.4e}, median={metrics['median']:.4e}, p95={metrics['p95']:.4e} over {metrics['count']} params"
+                                    )
+                                model_state = model.state_dict()
+                                filtered = {k: v for k, v in ema_sd.items() if k in model_state and getattr(v, "shape", None) == model_state[k].shape}
+                                print(f"Attempting EMA load (base-order nested): {len(filtered)} params")
+                                load_res = model.load_state_dict(filtered, strict=False)
+                                print(f"EMA load result -> missing: {len(load_res.missing_keys)}, unexpected: {len(load_res.unexpected_keys)}")
+                                ema_loaded = True
+                    # # Explicit EMA callback handling
+                    # if "EMA" in cb and isinstance(cb["EMA"], dict):
+                    #     ema_cb = cb["EMA"]
+                    #     # Direct weights + names on EMA callback
+                    #     if "ema_weights" in ema_cb:
+                    #         weights = ema_cb.get("ema_weights")
+                    #         name_key_candidates = ["param_names", "names", "parameter_names", "keys"]
+                    #         names = None
+                    #         for nk in name_key_candidates:
+                    #             if isinstance(ema_cb.get(nk), (list, tuple)):
+                    #                 names = ema_cb.get(nk)
+                    #                 break
+                    #         if isinstance(weights, (list, tuple)) and isinstance(names, (list, tuple)) and len(weights) == len(names):
+                    #             ema_candidates.append(dict(zip(names, weights)))
+                    #         elif isinstance(weights, (list, tuple)) and names is None:
+                    #             print("Warning: EMA callback has 'ema_weights' but no names list; skipping unsafe EMA mapping.")
+                    #     # Nested 'ema' dict
+                    #     if isinstance(ema_cb.get("ema"), dict):
+                    #         nested = ema_cb["ema"]
+                    #         if "ema_weights" in nested or "weights" in nested:
+                    #             weights = nested.get("ema_weights", nested.get("weights"))
+                    #             name_key_candidates = ["param_names", "names", "parameter_names", "keys"]
+                    #             names = None
+                    #             for nk in name_key_candidates:
+                    #                 if isinstance(nested.get(nk), (list, tuple)):
+                    #                     names = nested.get(nk)
+                    #                     break
+                    #             if isinstance(weights, (list, tuple)) and isinstance(names, (list, tuple)) and len(weights) == len(names):
+                    #                 ema_candidates.append(dict(zip(names, weights)))
+                    # Generic callbacks
+                    # for v in cb.values():
+                    #     if isinstance(v, dict):
+                    #         for k in ["ema_state_dict", "state_dict", "model_state_dict"]:
+                    #             if k in v and isinstance(v[k], dict):
+                    #                 ema_candidates.append(v[k])
+                    #         # Fallback: list of tensors + names
+                    #         if "ema_weights" in v:
+                    #             weights = v.get("ema_weights")
+                    #             # Accept several possible keys for parameter names
+                    #             name_key_candidates = ["param_names", "names", "parameter_names", "keys"]
+                    #             names = None
+                    #             for nk in name_key_candidates:
+                    #                 if isinstance(v.get(nk), (list, tuple)):
+                    #                     names = v.get(nk)
+                    #                     break
+                    #             if isinstance(weights, (list, tuple)) and isinstance(names, (list, tuple)) and len(weights) == len(names):
+                    #                 ema_candidates.append(dict(zip(names, weights)))
+                    #             elif isinstance(weights, (list, tuple)) and names is None:
+                    #                 print("Warning: Found 'ema_weights' in callbacks but no accompanying names list (param_names/names). Skipping unsafe EMA mapping.")
+                    #         # Nested 'ema' dicts in generic callbacks
+                    #         if isinstance(v.get("ema"), dict):
+                    #             nested = v["ema"]
+                    #             if "ema_weights" in nested or "weights" in nested:
+                    #                 weights = nested.get("ema_weights", nested.get("weights"))
+                    #                 name_key_candidates = ["param_names", "names", "parameter_names", "keys"]
+                    #                 names = None
+                    #                 for nk in name_key_candidates:
+                    #                     if isinstance(nested.get(nk), (list, tuple)):
+                    #                         names = nested.get(nk)
+                    #                         break
+                    #                 if isinstance(weights, (list, tuple)) and isinstance(names, (list, tuple)) and len(weights) == len(names):
+                    #                     ema_candidates.append(dict(zip(names, weights)))
+
+            # # Try to load the first compatible EMA state_dict
+            # model_state = model.state_dict()
+            # for ema_sd in ema_candidates:
+            #     if not isinstance(ema_sd, dict):
+            #         continue
+            #     # Filter to keys present in model and matching shape
+            #     filtered = {k: v for k, v in ema_sd.items() if k in model_state and getattr(v, "shape", None) == model_state[k].shape}
+            #     if not filtered:
+            #         continue
+            #     missing_before = set(model_state.keys()) - set(filtered.keys())
+            #     unexpected_before = set(filtered.keys()) - set(model_state.keys())
+            #     print(f"Attempting EMA load: {len(filtered)} params | missing ignored: {len(missing_before)} | unexpected ignored: {len(unexpected_before)}")
+            #     load_res = model.load_state_dict(filtered, strict=False)
+            #     print(f"EMA load result -> missing: {len(load_res.missing_keys)}, unexpected: {len(load_res.unexpected_keys)}")
+            #     ema_loaded = True
+            #     break
+
+            if not ema_loaded:
+                print("Warning: No compatible EMA weights found or shapes mismatched; skipping EMA load.")
+        except Exception as e:
+            print(f"Warning: Failed to load EMA weights safely: {e}. Proceeding without EMA.")
 
     print(f"Finished loading model {ckpt_path}")
     return model
+
+# def load_pl_module_from_checkpoint(
+#     filepath: Union[Path, str],
+#     epoch: int = 1,
+#     overwrite_cfg: dict = {},
+#     use_ema_weights: bool = False
+# ):
+#     if isinstance(filepath, str):
+#         filepath = Path(filepath)
+
+#     if filepath.is_dir():
+#         filedir = filepath
+#         ckpt_path = get_checkpoint_i_from_dir(dir=filedir, i=epoch)
+#     elif filepath.is_file():
+#         assert filepath.suffix == ".ckpt", "File must have .ckpt extension"
+#         ckpt_path = filepath
+#         filedir = filepath.parents[0]
+#     else:
+#         raise ValueError(f"not valid file path: {str(filepath)}")
+#     config = get_config_from_dir(filedir)
+#     class_name = config.model.pop("_target_")
+#     if "_recursive_" in config.model:
+#         del config.model["_recursive_"]
+#     print(f"class_name {class_name}")
+#     module_class = load_class(class_name)
+#     print(f"Loading model from {ckpt_path}")
+#     load_cfg = {**config.model, **overwrite_cfg}
+#     model = module_class.load_from_checkpoint(ckpt_path, **load_cfg)
+#      # Load EMA weights if they exist and the flag is set
+#     if use_ema_weights:
+#         checkpoint_data = torch.load(ckpt_path)
+#         if "ema_weights" in checkpoint_data['callbacks']['EMA']:
+#             ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
+            
+#             # Convert list of tensors to a state_dict format
+#             ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model.named_parameters())}
+            
+#             model.load_state_dict(ema_weights_dict)
+#             print("Successfully loaded EMA weights from checkpoint!")
+#         else:
+#             print("Warning: No EMA weights found in checkpoint!")
+
+#     print(f"Finished loading model {ckpt_path}")
+#     return model
 
 
 
@@ -175,6 +468,8 @@ def get_default_beso_and_env(train_folder, dataset_path, checkpoint, env=None, l
     data_module.setup()
     dataloader = data_module.val_dataloader()
     dataset = dataloader.dataset.datasets["lang"]
+    mean, std = data_module.get_normalize_val('rgb_static')
+    logger.info(f"Normalization parameters for 'rgb_static': mean={mean}, std={std}")
     if device_id != 'cpu':
         device = torch.device(f"cuda:{device_id}")
     else:

@@ -1,0 +1,22 @@
+latent_motion_tokenizer_config_path: "/data/250010208/whl/code/Moto/latent_motion_tokenizer/configs/models/model_for_calvin.yaml"
+dataset_config_path: "/data/250010208/whl/code/Moto/latent_motion_tokenizer/configs/data/calvin.yaml"
+dataloader_config:
+  bs_per_gpu: 64
+  workers_per_gpu: 7
+  prefetch_factor: 2
+rgb_preprocessor_config: 
+  model_vision_type: "mae"
+  vision_aug_config: 
+    do_random_resized_crop: false
+    do_random_shift: true
+training_config:
+  num_epochs: 21
+  num_warmup_epochs: 1
+  print_steps: 100
+  lr_max: 0.0001
+  weight_decay: 0.0001
+  gradient_accumulation_steps: 2
+  save_epochs: 1
+  save_steps: 1000
+  save_path: "/data/250010208/whl/results/Moto/latent_motion_tokenizer/outputs/calvin/single_view_b64_gpu4_calvin_ABC_D/"
+  resume_ckpt_path: null

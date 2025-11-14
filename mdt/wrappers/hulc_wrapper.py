@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class HulcWrapper(gym.Wrapper):
     def __init__(self, dataset_loader, device, show_gui=False, **kwargs):
         self.set_egl_device(device)
+        os.environ["EGL_VISIBLE_DEVICE"] = "0"
         env = get_env(
             dataset_loader.abs_datasets_dir, show_gui=show_gui, obs_space=dataset_loader.observation_space, **kwargs
         )
@@ -29,6 +30,9 @@ class HulcWrapper(gym.Wrapper):
 
     @staticmethod
     def set_egl_device(device):
+        os.environ["EGL_VISIBLE_DEVICES"] = "0"
+        logger.info(f"EGL_DEVICE_ID 0 (default) <==> CUDA_DEVICE_ID {torch.cuda.current_device()}")
+        return
         if "EGL_VISIBLE_DEVICES" in os.environ:
             logger.warning("Environment variable EGL_VISIBLE_DEVICES is already set. Is this intended?")
         cuda_id = device.index if device.type == "cuda" else 0

@@ -67,7 +67,12 @@ class EMA(Callback):
             )
         if not (0 <= decay <= 1):
             raise MisconfigurationException("EMA decay value must be between 0 and 1")
+        # Internal EMA storage (list aligned with model.state_dict().values()) for fast updates
         self._ema_model_weights: Optional[List[torch.Tensor]] = None
+        # Parameter names snapshot to map EMA list <-> named state_dict
+        self._ema_state_keys: Optional[List[str]] = None
+        # Buffer for loading EMA weights saved as a dict (named state_dict) before model is available
+        self._ema_weights_loaded: Optional[Dict[str, torch.Tensor]] = None
         self._overflow_buf: Optional[torch.Tensor] = None
         self._cur_step: Optional[int] = None
         self._weights_buffer: Optional[List[torch.Tensor]] = None
@@ -92,8 +97,29 @@ class EMA(Callback):
 
     def on_train_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         logging.info('Creating EMA weights copy.')
+        # If we have previously loaded EMA weights saved as a named dict, map them to list order now
         if self._ema_model_weights is None:
-            self._ema_model_weights = [p.detach().clone() for p in pl_module.state_dict().values()]
+            model_sd = pl_module.state_dict()
+            if self._ema_weights_loaded is not None and isinstance(self._ema_weights_loaded, dict):
+                self._ema_state_keys = list(model_sd.keys())
+                mapped: List[torch.Tensor] = []
+                missing = []
+                for k, v in model_sd.items():
+                    if k in self._ema_weights_loaded:
+                        mapped.append(self._ema_weights_loaded[k].detach().clone())
+                    else:
+                        # Fallback to current weight if missing in loaded EMA
+                        missing.append(k)
+                        mapped.append(v.detach().clone())
+                if missing:
+                    logging.info(f"EMA: {len(missing)} keys missing in loaded EMA state; using current weights for them")
+                self._ema_model_weights = mapped
+                # clear buffer to free memory
+                self._ema_weights_loaded = None
+            else:
+                # Fresh init: snapshot keys and weights
+                self._ema_state_keys = list(model_sd.keys())
+                self._ema_model_weights = [p.detach().clone() for p in model_sd.values()]
         # ensure that all the weights are on the correct device
         self._ema_model_weights = [p.to(pl_module.device) for p in self._ema_model_weights]
         self._overflow_buf = torch.IntTensor([0]).to(pl_module.device)
@@ -143,14 +169,28 @@ class EMA(Callback):
 
     def state_dict(self) -> Dict[str, Any]:
         if self.save_ema_weights_in_callback_state:
+            # Export EMA weights as a named state_dict so users can directly call model.load_state_dict(...)
+            if self._ema_state_keys is not None and self._ema_model_weights is not None:
+                ema_named = {k: v for k, v in zip(self._ema_state_keys, self._ema_model_weights)}
+                return dict(cur_step=self._cur_step, ema_weights=ema_named)
+            # Fallback: export raw list (legacy)
             return dict(cur_step=self._cur_step, ema_weights=self._ema_model_weights)
         return dict(cur_step=self._cur_step)
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        self._cur_step = state_dict['cur_step']
-        # when loading using NeMo, ema weights will be loaded by the experiment manager separately.
-        if self._ema_model_weights is None:
-            self._ema_model_weights = state_dict.get('ema_weights')
+        self._cur_step = state_dict.get('cur_step', None)
+        # Accept both dict (named state_dict) and list (legacy) formats
+        ema_obj = state_dict.get('ema_weights', None)
+        if ema_obj is None:
+            return
+        if isinstance(ema_obj, dict):
+            # Store temporarily; map to list once model is available on on_train_start
+            self._ema_weights_loaded = ema_obj
+            self._ema_model_weights = None
+        else:
+            # Legacy list format
+            self._ema_model_weights = ema_obj
+            self._ema_weights_loaded = None
 
     def on_load_checkpoint(
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", checkpoint: Dict[str, Any]
@@ -169,7 +209,15 @@ class EMA(Callback):
             ema_path = trainer.ckpt_path.replace(ext, f'-EMA{ext}')
             if os.path.exists(ema_path):
                 ema_state_dict = torch.load(ema_path, map_location=torch.device('cpu'))
-                self._ema_model_weights = ema_state_dict['state_dict'].values()
+                # Expect a named state_dict under 'state_dict'; store to buffer then map on train start
+                if isinstance(ema_state_dict, dict) and 'state_dict' in ema_state_dict and isinstance(ema_state_dict['state_dict'], dict):
+                    self._ema_weights_loaded = ema_state_dict['state_dict']
+                    self._ema_model_weights = None
+                else:
+                    # Fallback: accept raw list if present
+                    vals = ema_state_dict.get('state_dict')
+                    if isinstance(vals, list):
+                        self._ema_model_weights = vals
                 del ema_state_dict
                 logging.info("EMA weights have been loaded successfully. Continuing training with saved EMA weights.")
             else:

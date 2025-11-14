@@ -1,4 +1,4 @@
-_target_: mdt.models.mdt_3d_latent_action.MDT3dLatentActionAgent
+_target_: mdt.models.mdt_3d_latent_action_4.MDT3dLatentActionAgent
 _recursive_: false
 
 defaults:
@@ -24,7 +24,8 @@ use_distributed_clip: True
 use_text_not_embedding: True
 ckpt_path: null
 seed: ${seed}
-tokenizer_ckpt_path: '/home/hlwang/mdt_policy/mdt/latent_motion_tokenizer/saved_epoch_8_step_51208/pytorch_model.bin'
+tokenizer_ckpt_path: '/data/250010208/whl/latent_motion_tokenizer/paired_b32_gpu5_calvin_D_D_3d/saved_epoch_13_step_52013'
+latent_action_num: 2
 
 optimizer:
   _target_: torch.optim.AdamW

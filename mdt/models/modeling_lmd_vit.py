@@ -38,8 +38,32 @@ class LMDViTEmbeddings(nn.Module):
         self.position_embeddings = nn.Parameter(torch.randn(1, seq_len, config.hidden_size))
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.config = config
-        self.lang_tokenizer=AutoTokenizer.from_pretrained('t5-base') if query_fusion_mode == 'add_with_corner' else None
-        self.lang_encoder=T5EncoderModel.from_pretrained('t5-base') if query_fusion_mode == 'add_with_corner' else None
+        # Prefer local HF cache for T5 when available
+        if query_fusion_mode == 'add_with_corner':
+            import os
+            hf_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+            t5_repo_root = os.path.join(hf_home, 'hub', 'models--t5-base')
+            t5_snapshots = os.path.join(t5_repo_root, 'snapshots')
+            t5_local_dir = None
+            try:
+                if os.path.isdir(t5_snapshots):
+                    candidates = sorted(
+                        [d for d in os.listdir(t5_snapshots) if os.path.isdir(os.path.join(t5_snapshots, d))]
+                    )
+                    if candidates:
+                        t5_local_dir = os.path.join(t5_snapshots, candidates[-1])
+            except Exception:
+                t5_local_dir = None
+
+            if t5_local_dir and os.path.isdir(t5_local_dir):
+                self.lang_tokenizer = AutoTokenizer.from_pretrained(t5_local_dir, local_files_only=True)
+                self.lang_encoder = T5EncoderModel.from_pretrained(t5_local_dir, local_files_only=True)
+            else:
+                self.lang_tokenizer = AutoTokenizer.from_pretrained('t5-base')
+                self.lang_encoder = T5EncoderModel.from_pretrained('t5-base')
+        else:
+            self.lang_tokenizer = None
+            self.lang_encoder = None
         self.lang_max_length = getattr(config, 'lang_max_length', 3)
         self.lang_embedding_dim = getattr(config, 'lang_embedding_dim', 768)
         self.lang_pooling_layer = nn.Linear(self.lang_embedding_dim*self.lang_max_length, config.hidden_size) if query_fusion_mode == 'add_with_corner' else None

@@ -7,6 +7,8 @@ from omegaconf import DictConfig
 import pyhash
 import torch
 from torch.utils.data import Dataset
+from torchvision.transforms.v2 import Resize, RandomResizedCrop, ColorJitter, InterpolationMode
+from einops import rearrange
 
 from mdt.datasets.utils.episode_utils import (
     get_state_info_dict,
@@ -95,6 +97,9 @@ class BaseDataset(Dataset):
         assert self.abs_datasets_dir.is_dir()
         logger.info(f"loading dataset at {self.abs_datasets_dir}")
         logger.info("finished loading dataset")
+        self.resize = Resize([224, 224], interpolation=InterpolationMode.BICUBIC, antialias=True)
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, -1, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, -1, 1, 1)
 
     def __getitem__(self, idx: Union[int, Tuple[int, int]]) -> Dict:
         """
@@ -148,6 +153,27 @@ class BaseDataset(Dataset):
         seq_dict = {**seq_state_obs, **seq_rgb_obs, **seq_depth_obs, **seq_acts, **info, **seq_lang}  # type:ignore
         seq_dict["idx"] = idx  # type:ignore
         seq_dict['future_frame_diff'] = episode['future_frame_diff']
+
+        latent_static = episode.get('latent_static', None)
+        latent_gripper = episode.get('latent_gripper', None)
+        latent_action_num = episode.get('latent_action_num', None)
+        latent_action_diff = episode.get('latent_action_diff', None)
+        seq_dict['latent_action_num'] = latent_action_num
+        seq_dict['latent_action_diff'] = latent_action_diff
+        if latent_static is not None:
+            latent_static = torch.from_numpy(rearrange(latent_static, 'b h w c -> b c h w')).float()
+            latent_static = latent_static*(1/225.0)
+            latent_static = self.resize(latent_static)
+            latent_static = (latent_static - self.mean) / (self.std + 1e-6)
+            latent_gripper = torch.from_numpy(rearrange(latent_gripper, 'b h w c -> b c h w')).float()
+            latent_gripper = latent_gripper*(1/225.0)
+            latent_gripper = self.resize(latent_gripper)
+            latent_gripper = (latent_gripper - self.mean) / (self.std + 1e-6)
+            seq_dict['latent_static'] = latent_static
+            seq_dict['latent_gripper'] = latent_gripper
+            seq_dict['latent_mean'] = self.mean
+            seq_dict['latent_std'] = self.std
+
         return seq_dict
 
     def _load_episode(self, idx: int, window_size: int) -> Dict[str, np.ndarray]:

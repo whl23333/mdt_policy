@@ -600,8 +600,10 @@ def load_clip(
     preprocess : Callable[[PIL.Image], torch.Tensor]
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
+    # Allow overriding cache directory with env var when not explicitly provided
+    cache_root = download_root or os.environ.get("CLIP_CACHE") or os.path.expanduser("~/.cache/clip")
     if name in _MODELS:
-        model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
+        model_path = _download(_MODELS[name], cache_root)
     elif os.path.isfile(name):
         model_path = name
     else:

@@ -9,18 +9,19 @@ eval_cfg_overwrite:
         lang_folder: lang_annotations
   overwrite_module_cfg:
     voltron_cache: /home/hlwang/mdt_policy/voltron_cache
+  epoch_to_load: 42
 
 ep_len: 360
 num_sequences: 1000
-num_videos: 10
+num_videos: 0
 lang_embeddings: null
 render: False
 log_wandb: True
 wandb:
   entity: omeryagmurlu
 debug: False
-dataset_path: /media/disk3/WHL/calvin_debug_dataset
-train_folder: /home/hlwang/mdt_policy/checkpoints/mdtv_1_abcd
+dataset_path: /data/share/calvin/task_D_D
+train_folder: /data/250010208/whl/results/mdt_policy/logs/runs/2025-10-18/16-58-18/
 model_name: mdt_test
 device: 0
 sampler_type: ddim

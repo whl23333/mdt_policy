@@ -27,6 +27,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         use_pos_embedding: bool = True,
         mask_probability: float = 0.0,
         parallel_prediction: bool = False,
+        soft_codebook: Optional[bool] = False,
     ):
         super().__init__()
         
@@ -79,6 +80,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         latent_motion_ids: Optional[torch.Tensor] = None,  # (batch, seq_len, per_latent_motion_len)
         attention_mask: Optional[torch.Tensor] = None,  # (batch, seq_len)
         train: bool = True,
+        seq_len: int = 1,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
@@ -94,21 +96,23 @@ class SimplifiedLatentMotionPredictor(nn.Module):
             Dictionary containing predictions and losses
         """
         batch_size, cond_tokens, _ = perceptual_features.shape
-        seq_len = latent_motion_ids.shape[1] if latent_motion_ids is not None else kwargs.get('seq_len', 1)
+        # seq_len = latent_motion_ids.shape[1] if latent_motion_ids is not None else kwargs.get('seq_len', 1)
+        assert seq_len == latent_motion_ids.shape[1], "seq_len must match latent_motion_ids length during training."
         
         # Project input features to hidden dimension
         cond_embeddings = self.input_projection(perceptual_features)  # (batch, cond_tokens, hidden_size)
         
         if train and latent_motion_ids is not None:
-            return self._forward_train(cond_embeddings, latent_motion_ids, attention_mask)
+            return self._forward_train(cond_embeddings, latent_motion_ids, attention_mask, seq_len=seq_len)
         else:
-            return self._forward_inference(cond_embeddings, attention_mask, **kwargs)
+            return self._forward_inference(cond_embeddings, attention_mask, seq_len=seq_len, **kwargs)
     
     def _forward_train(
         self, 
         cond_embeddings: torch.Tensor,  # (batch, cond_tokens, hidden_size)
         latent_motion_ids: torch.Tensor,  # (batch, seq_len, per_latent_motion_len)
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        seq_len: int = 1,
     ) -> Dict[str, torch.Tensor]:
         """Training forward pass with teacher forcing.
         If parallel_prediction is True, predict K=per_len tokens per timestep in parallel (factorized).
@@ -214,14 +218,14 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         """Inference forward pass with autoregressive generation."""
         
         if self.parallel_prediction:
-            ids = self._generate_latent_motion_parallel(
+            ids, logits = self._generate_latent_motion_parallel(
                 cond_embeddings,
                 attention_mask,
                 seq_len=seq_len,
                 temperature=temperature,
                 top_k=top_k,
             )
-            return {'latent_motion_id_preds': ids}
+            return {'latent_motion_id_preds': ids, 'latent_motion_logits_preds': logits}
         else:
             # Generate latent motion IDs autoregressively across all flattened tokens
             latent_motion_ids = self._generate_latent_motion(
@@ -335,6 +339,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
         current_sequence = torch.cat([cond_embeddings_normed, start_token_emb_normed], dim=1)  # (B, cond_tokens+1, H)
 
         all_ids = []
+        all_logits = []
         for t in range(seq_len):
             # Build attention mask for current sequence
             if attention_mask is not None:
@@ -353,6 +358,7 @@ class SimplifiedLatentMotionPredictor(nn.Module):
             # Parallel head -> (B, K*V) -> (B, K, V)
             logits = self.pred_latent_motion_parallel_head(ctx_hidden)
             logits = logits.view(batch_size, per_len, self.latent_motion_codebook_size)
+            all_logits.append(logits)
 
             # Apply temperature and top-k per K
             if temperature != 1.0:
@@ -380,7 +386,8 @@ class SimplifiedLatentMotionPredictor(nn.Module):
 
         # Stack steps -> (B, T, K)
         ids = torch.stack(all_ids, dim=1)
-        return ids
+        all_logits = torch.stack(all_logits, dim=1)  # (B, T, K, V)
+        return ids, all_logits
     
     def _compute_loss_flat_with_start(
         self, 

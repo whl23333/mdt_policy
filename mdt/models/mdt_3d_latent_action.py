@@ -15,6 +15,8 @@ from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 import einops 
 import torch.optim as optim
 import wandb
+from pytorch_lightning.loggers import WandbLogger
+import wandb
 
 from mdt.models.edm_diffusion.gc_sampling import *
 from mdt.models.edm_diffusion.utils import append_dims
@@ -41,6 +43,7 @@ from mdt.models.latent_motion_decoder import LatentMotionDecoder
 from mdt.models.m_former import MFormer, MFormer3D
 # Latent motion decoder
 from mdt.models.latent_motion_decoder import LatentMotionDecoder
+import torchvision.transforms as transforms
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,9 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         use_pretrained_encoder: bool = True,
         encoder_ckpt_path: Optional[str] = None,
         vq_ckpt_path: Optional[str] = None,
+        vq_up_resampler_ckpt_path: Optional[str] = None,
+        decoder1_ckpt_path: Optional[str] = None,
+        decoder2_ckpt_path: Optional[str] = None,
         # New parameters for 3D motion tokenization
         image_encoder_ckpt_path: Optional[str] = None,
         m_former_ckpt_path: Optional[str] = None,
@@ -158,6 +164,8 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         use_soft_codebook_training: bool = True,
         soft_code_temp: float = 1.0,
         soft_code_detach: bool = True,
+        # warm up epoch
+        warm_up_epoch: int = 0,
     ):
         super(MDT3dLatentActionAgent, self).__init__()
         self.latent_dim = latent_dim
@@ -193,6 +201,8 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                 mask_probability=0.0,
                 parallel_prediction=True,
             )
+            # warm up epoch
+            self.warm_up_epoch = warm_up_epoch
             
             # Pretrained models for 3D motion tokenization pipeline
             if self.use_pretrained_encoder:
@@ -202,6 +212,9 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                 self.pretrained_m_former3d = self._load_pretrained_m_former3d(m_former3d_ckpt_path)
                 self.pretrained_vq_down_resampler = self._load_pretrained_vq_down_resampler(vq_down_resampler_ckpt_path)
                 self.pretrained_vq = self._load_pretrained_vq(vq_ckpt_path)
+                self.pretrained_vq_up_resampler = self._load_pretrained_vq_up_resampler(vq_up_resampler_ckpt_path)
+                self.pretrained_decoder1 = self._load_pretrained_decoder(decoder1_ckpt_path)
+                self.pretrained_decoder2 = self._load_pretrained_decoder(decoder2_ckpt_path)
 
                 # Load all components from unified LatentMotionTokenizer3D checkpoint if provided
 
@@ -219,7 +232,13 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     param.requires_grad = False
                 for param in self.pretrained_vq.parameters():
                     param.requires_grad = False
-        
+                for param in self.pretrained_vq_up_resampler.parameters():
+                    param.requires_grad = False
+                for param in self.pretrained_decoder1.parameters():
+                    param.requires_grad = False
+                for param in self.pretrained_decoder2.parameters():
+                    param.requires_grad = False
+
         # goal encoders
         self.visual_goal = hydra.utils.instantiate(visual_goal)
         self.language_goal = hydra.utils.instantiate(language_goal) if language_goal else None
@@ -262,9 +281,29 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         self.ema_callback_idx = None
         if ckpt_path is not None:
             self.load_pretrained_parameters(ckpt_path)
-        # t5 tokenizer and encoder
-        self.t5_tokenizer = AutoTokenizer.from_pretrained("t5-base")
-        self.t5_encoder = T5EncoderModel.from_pretrained("t5-base")
+        # t5 tokenizer and encoder (prefer local HF cache if available)
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        t5_repo_root = os.path.join(hf_home, "hub", "models--t5-base")
+        t5_snapshots = os.path.join(t5_repo_root, "snapshots")
+        t5_local_dir = None
+        try:
+            if os.path.isdir(t5_snapshots):
+                # pick the most recent snapshot dir
+                candidates = sorted(
+                    [d for d in os.listdir(t5_snapshots) if os.path.isdir(os.path.join(t5_snapshots, d))]
+                )
+                if candidates:
+                    t5_local_dir = os.path.join(t5_snapshots, candidates[-1])
+        except Exception:
+            t5_local_dir = None
+
+        if t5_local_dir and os.path.isdir(t5_local_dir):
+            self.t5_tokenizer = AutoTokenizer.from_pretrained(t5_local_dir, local_files_only=True)
+            self.t5_encoder = T5EncoderModel.from_pretrained(t5_local_dir, local_files_only=True)
+        else:
+            # Fallback to hub name; will use mirror/HF cache settings if configured
+            self.t5_tokenizer = AutoTokenizer.from_pretrained("t5-base")
+            self.t5_encoder = T5EncoderModel.from_pretrained("t5-base")
         # t5 encoder freeze
         self.t5_encoder.eval()
         for param in self.t5_encoder.parameters():
@@ -283,16 +322,47 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             self.use_soft_codebook_training = use_soft_codebook_training
             self.soft_code_temp = soft_code_temp
             self.soft_code_detach = soft_code_detach
+        if self.latent_motion_pred:
+            self._val_images = []            # used to hold wandb.Image objects or file paths
+            self._val_images_max = 6 
+    
+    def is_warm_up_epoch(self) -> bool:
+        if self.latent_motion_pred:
+            return self.current_epoch < self.warm_up_epoch
+        else:
+            return False
+    
+    def set_requires_grad(self, model):
+        if self.is_warm_up_epoch():
+            for param in model.parameters():
+                param.requires_grad = False
+            model.eval()
+        else:
+            for param in model.parameters():
+                param.requires_grad = True
+            model.train()
 
     def _load_pretrained_image_encoder(self, image_encoder_ckpt_path):
         """Load pretrained image encoder (ViT-MAE)."""
-        # Initialize ViT-MAE model - try to use local cache first, fallback to HF
+        # Initialize ViT-MAE model - try to use local HF cache first, then fallback to hub
+        hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        vit_repo_root = os.path.join(hf_home, "hub", "models--facebook--vit-mae-large")
+        vit_snapshots = os.path.join(vit_repo_root, "snapshots")
+        vit_local_dir = None
         try:
-            model = ViTMAEModel.from_pretrained(
-                "/home/yyang-infobai/.cache/huggingface/hub/models--facebook--vit-mae-large/snapshots/142cb8c25e1b1bc1769997a919aa1b5a2345a6b8"
-            )
-        except:
-            # Fallback to HuggingFace hub
+            if os.path.isdir(vit_snapshots):
+                candidates = sorted(
+                    [d for d in os.listdir(vit_snapshots) if os.path.isdir(os.path.join(vit_snapshots, d))]
+                )
+                if candidates:
+                    vit_local_dir = os.path.join(vit_snapshots, candidates[-1])
+        except Exception:
+            vit_local_dir = None
+
+        if vit_local_dir and os.path.isdir(vit_local_dir):
+            model = ViTMAEModel.from_pretrained(vit_local_dir, local_files_only=True)
+        else:
+            # Fallback to HuggingFace hub (respects HF_ENDPOINT / mirrors if set)
             model = ViTMAEModel.from_pretrained("facebook/vit-mae-large")
             
         model.config.mask_ratio = 0.0
@@ -431,6 +501,70 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             param.requires_grad = False
             
         return model
+    
+    def _load_pretrained_vq_up_resampler(self, vq_up_resampler_ckpt_path):
+        """Load pretrained VQ up resampler."""
+        # Initialize VQ up resampler as per LatentMotionTokenizer3D structure
+        # codebook_dim (32) -> decoder hidden_size (768) -> image_encoder hidden_size (1024)
+        model = nn.Sequential(
+            nn.Linear(self.latent_motion_dim, self.latent_motion_dim),  # codebook_dim -> decoder hidden_size
+            nn.Tanh(),
+            nn.Linear(self.latent_motion_dim, 768)    # decoder hidden_size -> image_encoder hidden_size
+        )
+        model.eval()
+        
+        # Load pretrained weights if checkpoint provided  
+        if vq_up_resampler_ckpt_path is not None:
+            checkpoint = torch.load(vq_up_resampler_ckpt_path, map_location='cpu')
+            model.load_state_dict(checkpoint, strict=False)
+            print(f"Loaded vq_up_resampler from {vq_up_resampler_ckpt_path}")
+
+        # requires no grad
+        for param in model.parameters():
+            param.requires_grad = False
+
+        return model
+    
+    def _load_pretrained_decoder(self, decoder_ckpt_path):
+        """Load pretrained latent motion decoder."""
+        # Initialize LatentMotionDecoder with config from yaml
+        config = ViTConfig(
+            query_num=8,
+            attention_probs_dropout_prob=0.0,
+            hidden_act="gelu",
+            hidden_dropout_prob=0.0,
+            hidden_size=768,
+            image_size=224,
+            initializer_range=0.02,
+            intermediate_size=3072,
+            layer_norm_eps=1e-12,
+            model_type="vit",
+            num_attention_heads=12,
+            num_channels=3,
+            num_hidden_layers=12,
+            patch_size=16,
+            qkv_bias=True,
+            encoder_stride=16,
+            num_patches=196,
+            query_fusion_mode='add',
+        )
+        model = LatentMotionDecoder(
+            config=config,
+        )
+        model.eval()
+        
+        # Load pretrained weights if checkpoint provided
+        if decoder_ckpt_path is not None:
+            checkpoint = torch.load(decoder_ckpt_path, map_location='cpu')
+            model.load_state_dict(checkpoint, strict=False)
+            print(f"Loaded decoder from {decoder_ckpt_path}")
+
+        # requires no grad
+        for param in model.parameters():
+            param.requires_grad = False
+            
+        return model
+
 
     def load_from_latent_motion_tokenizer3d(self, tokenizer_ckpt_path):
         """
@@ -450,7 +584,10 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             'm_former': {},
             'm_former3d': {},
             'vq_down_resampler': {},
-            'vector_quantizer': {}
+            'vector_quantizer': {},
+            'vq_up_resampler': {},
+            'decoder1': {},
+            'decoder2': {},
         }
         
         # Parse checkpoint keys and distribute to components
@@ -470,7 +607,15 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             elif key.startswith('vector_quantizer.'):
                 component_key = key.replace('vector_quantizer.', '')
                 component_states['vector_quantizer'][component_key] = value
-        
+            elif key.startswith('vq_up_resampler.'):
+                component_key = key.replace('vq_up_resampler.', '')
+                component_states['vq_up_resampler'][component_key] = value
+            elif key.startswith('decoder1.'):
+                component_key = key.replace('decoder1.', '')
+                component_states['decoder1'][component_key] = value
+            elif key.startswith('decoder2.'):
+                component_key = key.replace('decoder2.', '')
+                component_states['decoder2'][component_key] = value
         # Load each component with extracted state dict
         # if component_states['image_encoder']:
         #     print("Loading image_encoder from unified checkpoint...")
@@ -495,6 +640,18 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             print("Loading vector_quantizer from unified checkpoint...")
             missing_keys, unexpected_keys = self.pretrained_vq.load_state_dict(component_states['vector_quantizer'], strict=False)
             print(f"vector_quantizer missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+        if component_states['vq_up_resampler']:
+            print("Loading vq_up_resampler from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_vq_up_resampler.load_state_dict(component_states['vq_up_resampler'], strict=False)
+            print(f"vq_up_resampler missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+        if component_states['decoder1']:
+            print("Loading decoder1 from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_decoder1.load_state_dict(component_states['decoder1'], strict=False)
+            print(f"decoder1 missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+        if component_states['decoder2']:
+            print("Loading decoder2 from unified checkpoint...")
+            missing_keys, unexpected_keys = self.pretrained_decoder2.load_state_dict(component_states['decoder2'], strict=False)
+            print(f"decoder2 missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
 
         # print("Successfully loaded all components from LatentMotionTokenizer3D checkpoint!")
         
@@ -633,18 +790,57 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         Load the pretrained parameters from the provided path.
         """
         print("Loading pretrained parameters")
-        checkpoint_data = torch.load(ckpt_path)
-        '''if 'callbacks'''
-        if "ema_weights" in checkpoint_data['callbacks']['EMA']:
-            ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
+        checkpoint_data = torch.load(ckpt_path, map_location="cpu")
+        # Prefer a named EMA state_dict if available; otherwise fall back to regular state_dict
+        state_to_load = None
+        try:
+            # Try common EMA dict locations first
+            if isinstance(checkpoint_data, dict):
+                # Top-level
+                for k in ["ema_state_dict", "state_dict_ema", "model_ema_state_dict"]:
+                    if k in checkpoint_data and isinstance(checkpoint_data[k], dict):
+                        state_to_load = checkpoint_data[k]
+                        break
+                # Under callbacks
+                if state_to_load is None and isinstance(checkpoint_data.get("callbacks"), dict):
+                    cb = checkpoint_data["callbacks"].get("EMA") if isinstance(checkpoint_data["callbacks"].get("EMA"), dict) else None
+                    if cb is not None:
+                        # Named dicts inside EMA callback
+                        for k in ["ema_state_dict", "state_dict", "model_state_dict"]:
+                            if k in cb and isinstance(cb[k], dict):
+                                state_to_load = cb[k]
+                                break
+                        # List + names fallback
+                        if state_to_load is None and "ema_weights" in cb and "param_names" in cb:
+                            weights = cb.get("ema_weights")
+                            names = cb.get("param_names")
+                            if isinstance(weights, (list, tuple)) and isinstance(names, (list, tuple)) and len(weights) == len(names):
+                                state_to_load = dict(zip(names, weights))
+            # Fall back to normal state_dict
+            if state_to_load is None:
+                state_to_load = checkpoint_data.get("state_dict", checkpoint_data)
+
+            # Filter keys by name and shape to avoid crashes
+            model_state = self.state_dict()
+            filtered = {k: v for k, v in state_to_load.items() if k in model_state and getattr(v, "shape", None) == model_state[k].shape}
+            load_res = self.load_state_dict(filtered, strict=False)
+            print(f"Loaded weights with filtering -> missing: {len(load_res.missing_keys)}, unexpected: {len(load_res.unexpected_keys)}")
+        except Exception as e:
+            print(f"Warning: Safe weight load failed: {e}. Trying raw 'state_dict' with strict=False")
+            raw_sd = checkpoint_data.get("state_dict", checkpoint_data)
+            self.load_state_dict(raw_sd, strict=False)
+        # checkpoint_data = torch.load(ckpt_path)
+        # '''if 'callbacks'''
+        # if "ema_weights" in checkpoint_data['callbacks']['EMA']:
+        #     ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
             
-            # Convert list of tensors to a state_dict format
-            ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(self.named_parameters())}
+        #     # Convert list of tensors to a state_dict format
+        #     ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(self.named_parameters())}
             
-            self.load_state_dict(ema_weights_dict)
-            print("Successfully loaded EMA weights from checkpoint!")
-        else:
-            self.load_state_dict(checkpoint_data['state_dict'])
+        #     self.load_state_dict(ema_weights_dict)
+        #     print("Successfully loaded EMA weights from checkpoint!")
+        # else:
+        #     self.load_state_dict(checkpoint_data['state_dict'])
         print("Successfully loaded weights from checkpoint!")
 
     def configure_optimizers(self):
@@ -684,13 +880,16 @@ class MDT3dLatentActionAgent(pl.LightningModule):
             {"params": self.clip_proj.parameters(), "weight_decay": self.optimizer_config.obs_encoder_weight_decay},
             {"params": self.logit_scale, "weight_decay":self.optimizer_config.obs_encoder_weight_decay},
         ])
-
         optimizer = torch.optim.AdamW(optim_groups, lr=self.optimizer_config.learning_rate, betas=self.optimizer_config.betas)
+        # keep refs for potential re-initialization at phase switch
+        self._optimizer = optimizer
 
         # Optionally initialize the scheduler
         if self.use_lr_scheduler:
             lr_configs = OmegaConf.create(self.lr_scheduler)
             scheduler = TriStageLRScheduler(optimizer, lr_configs)
+            # keep a ref to reset at phase switch
+            self._lr_scheduler = scheduler
             lr_scheduler = {
                 "scheduler": scheduler,
                 "interval": 'step',
@@ -716,7 +915,7 @@ class MDT3dLatentActionAgent(pl.LightningModule):
     
     def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):
 
-        self.model.train()
+        # self.model.train()
         noised_input = actions + noise * append_dims(sigmas, actions.ndim)
         context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
         return context 
@@ -881,6 +1080,20 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                         latent_motion_emb = soft_emb.detach() if self.soft_code_detach else soft_emb
                 else:
                     latent_motion_emb = None
+            
+            # In warm-up, isolate motion_transformer: block downstream grads if we still run diffusion later
+            if self.is_warm_up_epoch():
+                latent_motion_emb = latent_motion_emb.detach() if latent_motion_emb is not None else None
+
+            # If we are in warm-up stage, only optimize latent motion CE loss and skip other losses
+            if self.is_warm_up_epoch():
+                if self.latent_motion_pred:
+                    latent_motion_loss_total += latent_motion_loss
+                    total_loss += latent_motion_loss
+                # bookkeeping and skip the rest of this modality
+                batch_size[self.modality_scope] = dataset_batch["actions"].shape[0]
+                total_bs += dataset_batch["actions"].shape[0]
+                continue
 
             # Modified diffusion loss to include latent motion conditioning
             act_loss, sigmas, noise = self.diffusion_loss(
@@ -1080,12 +1293,89 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                     latent_motion_emb = self.pretrained_vq.get_codebook_entry(predicted_motion_indices)
                 else:
                     latent_motion_emb = None
+                # latent action generation loss
             
-            # latent action generation loss
-            gt_latent_motion_embeddings = self.pretrained_vq.get_codebook_entry(gt_latent_motion_indices)
-            cosine_sim = torch.nn.CosineSimilarity(dim=-1)
-            motion_sim = cosine_sim(latent_motion_emb, gt_latent_motion_embeddings).mean()
-            self.log(f"val/{self.modality_scope}_latent_motion_cosine_sim", motion_sim, on_step=False, on_epoch=True, sync_dist=True)
+                gt_latent_motion_embeddings = self.pretrained_vq.get_codebook_entry(gt_latent_motion_indices)
+                cosine_sim = torch.nn.CosineSimilarity(dim=-1)
+                motion_sim = cosine_sim(latent_motion_emb, gt_latent_motion_embeddings).mean()
+                self.log(f"val/{self.modality_scope}_latent_motion_cosine_sim", motion_sim, on_step=False, on_epoch=True, sync_dist=True)
+
+                # latent action image reconstruction
+                for t in range(latent_motion_emb.shape[1]):
+                    gt_latent_3d_motion_up = self.pretrained_vq_up_resampler(gt_latent_motion_embeddings)
+                    gt_recons_pixel_values1 = self.pretrained_decoder1(
+                        cond_input=rgb_static[:, t],
+                        latent_motion_tokens=gt_latent_3d_motion_up[:, t],
+                    )
+                    gt_recons_pixel_values2 = self.pretrained_decoder2(
+                        cond_input=rgb_gripper[:, t],
+                        latent_motion_tokens=gt_latent_3d_motion_up[:, t],
+                    )
+                    target_pixel_values1 = gen_static[:, t]
+                    target_pixel_values2 = gen_gripper[:, t]
+
+                    pred_latent_3d_motion_up = self.pretrained_vq_up_resampler(latent_motion_emb)
+                    pred_recons_pixel_values1 = self.pretrained_decoder1(
+                        cond_input=rgb_static[:, t],
+                        latent_motion_tokens=pred_latent_3d_motion_up[:, t],
+                    )
+                    pred_recons_pixel_values2 = self.pretrained_decoder2(
+                        cond_input=rgb_gripper[:, t],
+                        latent_motion_tokens=pred_latent_3d_motion_up[:, t],
+                    )
+
+                    recons_loss1 = F.mse_loss(pred_recons_pixel_values1, target_pixel_values1)
+                    recons_loss2 = F.mse_loss(pred_recons_pixel_values2, target_pixel_values2)
+                    gt_recons_loss1 = F.mse_loss(gt_recons_pixel_values1, target_pixel_values1)
+                    gt_recons_loss2 = F.mse_loss(gt_recons_pixel_values2, target_pixel_values2)
+                    # select batch 0 image for logging
+                    # denormalize images from [-1, 1] to [0, 1]
+                    mean, std = self.trainer.datamodule.get_normalize('rgb_static')
+                    mean = torch.tensor(mean, dtype=pred_recons_pixel_values1.dtype, device=pred_recons_pixel_values1.device).view(1, -1, 1, 1)
+                    std = torch.tensor(std, dtype=pred_recons_pixel_values1.dtype, device=pred_recons_pixel_values1.device).view(1, -1, 1, 1)
+                    pred_recons_pixel_values1 = pred_recons_pixel_values1 * std + mean
+                    target_pixel_values1 = target_pixel_values1 * std + mean
+                    gt_recons_pixel_values1 = gt_recons_pixel_values1 * std + mean
+                    pred_recons_pixel_values2 = pred_recons_pixel_values2 * std + mean
+                    target_pixel_values2 = target_pixel_values2 * std + mean
+                    gt_recons_pixel_values2 = gt_recons_pixel_values2 * std + mean
+                    pred_image1 = transforms.ToPILImage()(pred_recons_pixel_values1[0].detach().cpu())
+                    gt_image1 = transforms.ToPILImage()(gt_recons_pixel_values1[0].detach().cpu())
+                    target_image1 = transforms.ToPILImage()(target_pixel_values1[0].detach().cpu())
+                    pred_image2 = transforms.ToPILImage()(pred_recons_pixel_values2[0].detach().cpu())
+                    gt_image2 = transforms.ToPILImage()(gt_recons_pixel_values2[0].detach().cpu())
+                    target_image2 = transforms.ToPILImage()(target_pixel_values2[0].detach().cpu())
+                    self.log(f"val/{self.modality_scope}_latent_motion_recons_loss_view1_t{t}", recons_loss1, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log(f"val/{self.modality_scope}_latent_motion_gt_recons_loss_view1_t{t}", gt_recons_loss1, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log(f"val/{self.modality_scope}_latent_motion_recons_loss_view2_t{t}", recons_loss2, on_step=False, on_epoch=True, sync_dist=True)
+                    self.log(f"val/{self.modality_scope}_latent_motion_gt_recons_loss_view2_t{t}", gt_recons_loss2, on_step=False, on_epoch=True, sync_dist=True)
+                    
+
+                    # use wandb to log the images
+                    # Log images to wandb (only on global rank 0 and once per sequence to avoid duplicates)
+                    try:
+                        trainer = getattr(self, 'trainer', None)
+                        is_global_zero = True if trainer is None else getattr(trainer, 'is_global_zero', True)
+                        if is_global_zero and isinstance(getattr(self, 'logger', None), WandbLogger):
+                            # Only log one timestep (t==0) to reduce bandwidth
+                            if len(self._val_images) < self._val_images_max:
+                                self._val_images.append(wandb.Image(pred_image1, caption=f"{self.modality_scope}_pred"))
+                                self._val_images.append(wandb.Image(gt_image1, caption=f"{self.modality_scope}_gt"))
+                                self._val_images.append(wandb.Image(target_image1, caption=f"{self.modality_scope}_target"))
+                                self._val_images.append(wandb.Image(pred_image2, caption=f"{self.modality_scope}_pred"))
+                                self._val_images.append(wandb.Image(gt_image2, caption=f"{self.modality_scope}_gt"))
+                                self._val_images.append(wandb.Image(target_image2, caption=f"{self.modality_scope}_target"))
+                            # # Use the Wandb run to log the images with a step
+                            # run = self.logger.experiment
+                            # # prefer global_step when available
+                            # step = getattr(self, 'global_step', None)
+                            # if step is not None:
+                            #     run.log({f"val/{self.modality_scope}/recons_images": images}, step=step)
+                            # else:
+                            #     run.log({f"val/{self.modality_scope}/recons_images": images})
+                    except Exception as e:
+                        rank_zero_info(f"wandb image log failed: {e}")
+                    
 
             # predict the next action sequence with latent motion conditioning
             action_pred = self.denoise_actions(
@@ -1238,7 +1528,7 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         return token_seq
     
     def clip_extra_forward(self, perceptual_emb, latent_goal, actions, sigmas, noise):    
-        self.model.train()
+        # self.model.train()
         noised_input = actions + noise * append_dims(sigmas, actions.ndim)
         context = self.model.forward_context_only(perceptual_emb, noised_input, latent_goal, sigmas)
         return context
@@ -1352,12 +1642,15 @@ class MDT3dLatentActionAgent(pl.LightningModule):
         Computes the score matching loss given the perceptual embedding, latent goal, and desired actions.
         Optionally includes latent motion embeddings as additional conditioning.
         """
-        self.model.train()
+        # self.model.train()
         sigmas = self.make_sample_density()(shape=(len(actions),), device=self.device).to(self.device)
         noise = torch.randn_like(actions).to(self.device)
         
         # If latent motion embeddings are provided, concatenate them with latent_goal
         if self.latent_motion_pred and latent_motion_emb is not None:
+            # During warm-up, ensure no gradients can flow back to motion_transformer through diffusion
+            if self.is_warm_up_epoch():
+                latent_motion_emb = latent_motion_emb.detach()
             latent_motion_emb = self.embed_latent_motion_input(latent_motion_emb)
             latent_motion_emb = latent_motion_emb.view(latent_motion_emb.shape[0], -1, latent_motion_emb.shape[-1]) # (B, seq_len*per_latent_motion_len, hidden_dim)
         if latent_motion_emb is not None:
@@ -1707,9 +2000,9 @@ class MDT3dLatentActionAgent(pl.LightningModule):
                 self.ema_callback_idx = idx
                 break
     
-    @rank_zero_only
-    def on_train_epoch_start(self) -> None:
-        logger.info(f"Start training epoch {self.current_epoch}")
+    # @rank_zero_only
+    # def on_train_epoch_start(self) -> None:
+    #     logger.info(f"Start training epoch {self.current_epoch}")
 
     @rank_zero_only
     def on_train_epoch_end(self, unused: Optional = None) -> None:  # type: ignore
@@ -1718,6 +2011,18 @@ class MDT3dLatentActionAgent(pl.LightningModule):
     @rank_zero_only
     def on_validation_epoch_end(self) -> None:
         logger.info(f"Finished validation epoch {self.current_epoch}")
+        if self.latent_motion_pred:
+            if isinstance(getattr(self, "logger", None), WandbLogger):
+                run = self.logger.experiment
+                step = getattr(self, "global_step", None)
+                try:
+                    if step is not None:
+                        run.log({"val/recons_images": self._val_images}, step=step)
+                    else:
+                        run.log({"val/recons_images": self._val_images})
+                except Exception as e:
+                    rank_zero_info(f"wandb epoch log failed: {e}")
+            self._val_images = []
 
     def clip_auxiliary_loss(self, image_features, lang_features, mode='symmetric', lang_text=None):
         # Normalize the features
@@ -1749,17 +2054,141 @@ class MDT3dLatentActionAgent(pl.LightningModule):
     def on_validation_epoch_start(self) -> None:
         log_rank_0(f"Start validation epoch {self.current_epoch}")
 
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Filter out pretrained submodules from the saved checkpoint to avoid storing
+        large frozen pretrained weights (image encoder, m_former, vq, decoders, t5, etc.).
+
+        This method mutates the checkpoint dict in-place and is called by Lightning
+        right before writing the checkpoint to disk.
+        """
+        try:
+            state_dict = checkpoint.get("state_dict")
+            if isinstance(state_dict, dict):
+                excluded_prefixes = [
+                    "pretrained_image_encoder.",
+                    "pretrained_m_former.",
+                    "pretrained_m_former3d.",
+                    "pretrained_vq_down_resampler.",
+                    "pretrained_vq.",
+                    "pretrained_vq_up_resampler.",
+                    "pretrained_decoder1.",
+                    "pretrained_decoder2.",
+                    "t5_encoder.",
+                    # tokenizer usually has no parameters, but keep in list for safety
+                    "t5_tokenizer.",
+                ]
+
+                filtered = {k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in excluded_prefixes)}
+                removed = len(state_dict) - len(filtered)
+                if removed > 0:
+                    rank_zero_info(f"on_save_checkpoint: removed {removed} state_dict keys for excluded pretrained modules")
+                checkpoint["state_dict"] = filtered
+
+            # Also filter common EMA/state_dict_ema fields if present
+            # for ema_key in ("ema_state_dict", "state_dict_ema", "model_ema_state_dict"):
+            #     if ema_key in checkpoint and isinstance(checkpoint[ema_key], dict):
+            #         sd = checkpoint[ema_key]
+            #         filtered_ema = {k: v for k, v in sd.items() if not any(k.startswith(p) for p in excluded_prefixes)}
+            #         checkpoint[ema_key] = filtered_ema
+            if isinstance(checkpoint['callbacks']['EMA']['ema_weights'], dict):
+                sd = checkpoint['callbacks']['EMA']['ema_weights']
+                filtered_ema = {k: v for k, v in sd.items() if not any(k.startswith(p) for p in excluded_prefixes)}
+                removed_ema = len(sd) - len(filtered_ema)
+                if removed_ema > 0:
+                    rank_zero_info(f"on_save_checkpoint: removed {removed_ema} EMA state_dict keys for excluded pretrained modules")
+                checkpoint['callbacks']['EMA']['ema_weights'] = filtered_ema
+        except Exception as e:
+            # Don't fail checkpointing because of filtering; just log
+            rank_zero_info(f"on_save_checkpoint: filtering pretrained keys failed: {e}")
+
     @rank_zero_only
     def on_train_epoch_start(self) -> None:
         logger.info(f"Start training epoch {self.current_epoch}")
+        if self.current_epoch == self.warm_up_epoch and self.latent_motion_pred and self.warm_up_epoch > 0:
+            logger.info("Warm-up phase ended. Unfreezing all model parameters.")
+            import gc
+            gc.collect()
+            # empty cache
+            torch.cuda.empty_cache()
+            # Restart LR scheduler from step 0 (restart full schedule for all params)
+            try:
+                if self.use_lr_scheduler and hasattr(self, "_lr_scheduler") and self._lr_scheduler is not None:
+                    sch = self._lr_scheduler
+                    # reset internal counters and set lr to initial
+                    if hasattr(sch, "update_step"):
+                        sch.update_step = 0
+                    if hasattr(sch, "init_lr"):
+                        sch.lr = sch.init_lr
+                    # set optimizer lrs to scheduler current lr
+                    try:
+                        # preferred path via base class API
+                        sch.set_lr(sch.optimizer, sch.lr)
+                    except Exception:
+                        # fallback: set on all optimizers param groups
+                        optimizers = self.optimizers()
+                        optim_list = optimizers if isinstance(optimizers, (list, tuple)) else [optimizers]
+                        for opt in optim_list:
+                            for pg in opt.param_groups:
+                                pg["lr"] = float(sch.lr)
+                    logger.info("TriStageLRScheduler reset: update_step=0, lr set to init_lr.")
+            except Exception as e:
+                logger.info(f"Scheduler reset at phase switch failed: {e}")
+
+            # Re-initialize EMA at the phase transition
+            try:
+                if self.ema_callback_idx is None and hasattr(self, "trainer") and self.trainer is not None:
+                    for idx, cb in enumerate(self.trainer.callbacks):
+                        if isinstance(cb, EMA):
+                            self.ema_callback_idx = idx
+                            break
+                if self.ema_callback_idx is not None and hasattr(self, "trainer") and self.trainer is not None:
+                    ema_cb = self.trainer.callbacks[self.ema_callback_idx]
+                    # Recreate EMA weights snapshot from current model weights
+                    # Force rebuild by clearing previous EMA weights if they exist
+                    if hasattr(ema_cb, "_ema_model_weights"):
+                        ema_cb._ema_model_weights = None
+                    ema_cb.on_train_start(self.trainer, self)
+                    # Restart EMA decay schedule from current step
+                    if hasattr(ema_cb, "start_step"):
+                        ema_cb.start_step = getattr(self.trainer, "global_step", 0)
+                    if hasattr(ema_cb, "_cur_step"):
+                        ema_cb._cur_step = None
+                    logger.info("EMA re-initialized at phase transition.")
+            except Exception as e:
+                logger.info(f"EMA re-initialization failed: {e}")
+        # Freeze/unfreeze core modules according to warm-up stage
+        self.set_requires_grad(self.model)
+        self.set_requires_grad(self.static_resnet)
+        self.set_requires_grad(self.gripper_resnet)
+        if self.language_goal is not None:
+            self.set_requires_grad(self.language_goal)
+        self.set_requires_grad(self.visual_goal)
+        self.set_requires_grad(self.gen_img)
+        self.set_requires_grad(self.clip_proj)
+        # Embedding layers used upstream of motion_transformer should be frozen in warm-up
+        # self.set_requires_grad(self.embed_lang)
+        # self.set_requires_grad(self.embed_mae)
+        # self.set_requires_grad(self.embed_patch)
+        # Adapter from codebook to diffusion policy should not train in warm-up
+        if hasattr(self, "embed_latent_motion_input"):
+            self.set_requires_grad(self.embed_latent_motion_input)
+        # Single-parameter logit scale for CLIP loss
+        try:
+            if self.is_warm_up_epoch():
+                self.logit_scale.requires_grad = False
+            else:
+                self.logit_scale.requires_grad = True
+        except Exception:
+            pass
 
     @rank_zero_only
     def on_train_epoch_end(self, unused: Optional = None) -> None:  # type: ignore
         logger.info(f"Finished training epoch {self.current_epoch}")
         
-    @rank_zero_only
-    def on_validation_epoch_end(self) -> None:
-        logger.info(f"Finished validation epoch {self.current_epoch}")
+    # @rank_zero_only
+    # def on_validation_epoch_end(self) -> None:
+    #     logger.info(f"Finished validation epoch {self.current_epoch}")
 
     def on_validation_epoch_start(self) -> None:
         log_rank_0(f"Start validation epoch {self.current_epoch}")

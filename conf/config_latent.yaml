@@ -1,7 +1,7 @@
 defaults:
-  - callbacks: calvin
-  # - callbacks: no_rollout
-  - datamodule: calvin
+  # - callbacks: calvin
+  - callbacks: no_rollout
+  - datamodule: calvin_latent_lang
   - model: mdt_3d_latent_agent # mdt_agent
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
@@ -9,20 +9,20 @@ defaults:
 # /home/hk-project-robolear/ft4740/code/calvin_d_old/dataset/task_D_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABC_D
 # /hkfs/work/workspace/scratch/ft4740-play3/data/task_ABCD_D
-root_data_dir: /media/disk3/WHL/task_D_D
+root_data_dir: /data/share/calvin/task_D_D
 lang_folder: lang_clip_resnet50
 vis_clip_model_name: ViT-B/16 
 clip_lang_model_name: ViT-B/32
 
-log_dir: /home/hlwang/mdt_policy/logs
+log_dir: /data/250010208/whl/results/mdt_policy/logs
 slurm: false
 min_window_size: 21 # 21
 max_window_size: 50
 future_range: 29
 seed: 242
 device: 'cuda'
-batch_size: 16 # 38 # 128
-devices: 8
+batch_size: 128 # 38 # 128
+devices: 1
 goal_window_size: 1
 act_dim: 7
 obs_dim: 384
@@ -32,7 +32,7 @@ act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
 gen_img_res: 112
-max_epochs: 35
+max_epochs: 45
 rollout_lh_skip_epochs: 29
 window_sampling_strategy: 'geometric' 
 num_tokens_voltron: 3
@@ -54,10 +54,10 @@ trainer:
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
   save_dir: .
-  name: logger
+  name: mdt_seq_len_latent_action_training_lang_only_softcode
   log_model: false
   entity: whl23333-tsinghua-university
-  project: mdt_policy
+  project: mdt_policy_wo_3d_latent_action
 
 
 hydra:

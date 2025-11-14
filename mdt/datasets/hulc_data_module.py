@@ -14,6 +14,7 @@ import torchvision
 import mdt
 from mdt.datasets.utils.episode_utils import load_dataset_statistics
 from mdt.datasets.utils.shared_memory_utils import load_shm_lookup, save_shm_lookup, SharedMemoryLoader
+import torch
 
 logger = logging.getLogger(__name__)
 DEFAULT_TRANSFORM = OmegaConf.create({"train": None, "val": None})
@@ -159,3 +160,30 @@ class HulcDataModule(pl.LightningDataModule):
         # combined_val_loaders = val_dataloaders['vis']
         combined_val_loaders = CombinedLoader(val_dataloaders, "max_size_cycle")
         return combined_val_loaders
+    def get_normalize(self, modality: str, index=-1):
+        """
+        Get the mean and std used in Normalize transform for a given modality.
+
+        Args:
+            modality: Modality name.
+        """
+        comp = self.train_transforms[modality]
+        normals = [t for t in comp.transforms if isinstance(t, torchvision.transforms.Normalize)]
+        normal = normals[index]
+        mean_t = torch.tensor(normal.mean) if not isinstance(normal.mean, torch.Tensor) else normal.mean
+        std_t = torch.tensor(normal.std) if not isinstance(normal.std, torch.Tensor) else normal.std
+        return mean_t, std_t
+
+    def get_normalize_val(self, modality: str, index=-1):
+        """
+        Get the mean and std used in Normalize transform for a given modality.
+
+        Args:
+            modality: Modality name.
+        """
+        comp = self.val_transforms[modality]
+        normals = [t for t in comp.transforms if isinstance(t, torchvision.transforms.Normalize)]
+        normal = normals[index]
+        mean_t = torch.tensor(normal.mean) if not isinstance(normal.mean, torch.Tensor) else normal.mean
+        std_t = torch.tensor(normal.std) if not isinstance(normal.std, torch.Tensor) else normal.std
+        return mean_t, std_t
